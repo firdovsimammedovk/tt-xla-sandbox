@@ -1,0 +1,160 @@
+// SPDX-FileCopyrightText: © 2024 Tenstorrent AI ULC
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+// This file incorporates work covered by the following copyright and permission
+// notice:
+// SPDX-FileCopyrightText: Copyright 2023 The IREE Authors
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// https://llvm.org/LICENSE.txt
+
+#include "api/device_description.h"
+
+// c++ standard library includes
+#include <sstream>
+
+// tracy includes
+#include "tracy/Tracy.hpp"
+
+// tt-xla includes
+#include "utils/logging.h"
+
+namespace tt::pjrt {
+
+// Helper to create attributes.
+PJRT_NamedValue createStringAttribute(const std::string &name,
+                                      const std::string &value) {
+  PJRT_NamedValue attr;
+  attr.struct_size = PJRT_NamedValue_STRUCT_SIZE;
+  attr.extension_start = nullptr;
+  attr.name = name.c_str();
+  attr.name_size = name.size();
+  attr.type = PJRT_NamedValue_kString;
+  attr.string_value = value.c_str();
+  attr.value_size = value.size();
+  return attr;
+}
+
+PJRT_NamedValue createInt64Attribute(const std::string &name, int64_t value) {
+  PJRT_NamedValue attr;
+  attr.struct_size = PJRT_NamedValue_STRUCT_SIZE;
+  attr.extension_start = nullptr;
+  attr.name = name.c_str();
+  attr.name_size = name.size();
+  attr.type = PJRT_NamedValue_kInt64;
+  attr.int64_value = value;
+  attr.value_size = 1;
+  return attr;
+}
+
+DeviceDescription::DeviceDescription(int32_t device_id, tt::target::Arch arch,
+                                     uint64_t dram_size_bytes)
+    : m_device_id(device_id), m_process_index(0),
+      m_device_kind(tt::target::EnumNameArch(arch)) {
+  std::stringstream ss;
+  ss << "TTDevice(id=" << m_device_id << ", arch=" << m_device_kind << ")";
+  m_user_string = ss.str();
+
+  // Create attributes list
+  m_attributes.push_back(createStringAttribute(
+      m_arch_attr_name,
+      m_device_kind)); // device arch attribute (e.g. "wormhole_b0")
+  // Total on-device DRAM in bytes, summed across all DRAM channels.  0 means
+  // "unknown" (e.g. when DeviceDescription is constructed outside of the
+  // client_instance flow, such as in unit tests).
+  m_attributes.push_back(createInt64Attribute(
+      m_dram_size_attr_name, static_cast<int64_t>(dram_size_bytes)));
+}
+
+void DeviceDescription::bindApi(PJRT_Api *api) {
+  api->PJRT_DeviceDescription_Id = internal::onDeviceDescriptionId;
+  api->PJRT_DeviceDescription_ProcessIndex =
+      internal::onDeviceDescriptionProcessIndex;
+  api->PJRT_DeviceDescription_Attributes =
+      internal::onDeviceDescriptionAttributes;
+  api->PJRT_DeviceDescription_Kind = internal::onDeviceDescriptionKind;
+  api->PJRT_DeviceDescription_DebugString =
+      internal::onDeviceDescriptionDebugString;
+  api->PJRT_DeviceDescription_ToString = internal::onDeviceDescriptionToString;
+}
+
+namespace internal {
+
+PJRT_Error *onDeviceDescriptionId(PJRT_DeviceDescription_Id_Args *args) {
+  ZoneScoped;
+  DLOG_F(LOG_DEBUG, "DeviceDescription::PJRT_DeviceDescription_Id");
+
+  args->id = DeviceDescription::unwrap(args->device_description)->getDeviceId();
+
+  return nullptr;
+}
+
+PJRT_Error *onDeviceDescriptionProcessIndex(
+    PJRT_DeviceDescription_ProcessIndex_Args *args) {
+  ZoneScoped;
+  DLOG_F(LOG_DEBUG, "DeviceDescription::PJRT_DeviceDescription_ProcessIndex");
+
+  args->process_index =
+      DeviceDescription::unwrap(args->device_description)->getProcessIndex();
+
+  return nullptr;
+}
+
+PJRT_Error *
+onDeviceDescriptionAttributes(PJRT_DeviceDescription_Attributes_Args *args) {
+  ZoneScoped;
+  DLOG_F(LOG_DEBUG, "DeviceDescription::PJRT_DeviceDescription_Attributes");
+
+  const auto &attributes =
+      DeviceDescription::unwrap(args->device_description)->getAttributes();
+
+  args->num_attributes = attributes.size();
+  args->attributes = attributes.data();
+
+  return nullptr;
+}
+
+PJRT_Error *onDeviceDescriptionKind(PJRT_DeviceDescription_Kind_Args *args) {
+  ZoneScoped;
+  DLOG_F(LOG_DEBUG, "DeviceDescription::PJRT_DeviceDescription_Kind");
+
+  const std::string &device_kind =
+      DeviceDescription::unwrap(args->device_description)->getDeviceKind();
+
+  args->device_kind = device_kind.data();
+  args->device_kind_size = device_kind.size();
+
+  return nullptr;
+}
+
+PJRT_Error *
+onDeviceDescriptionDebugString(PJRT_DeviceDescription_DebugString_Args *args) {
+  ZoneScoped;
+  DLOG_F(LOG_DEBUG, "DeviceDescription::PJRT_DeviceDescription_DebugString");
+
+  const std::string &debug_str =
+      DeviceDescription::unwrap(args->device_description)->toDebugString();
+
+  args->debug_string = debug_str.data();
+  args->debug_string_size = debug_str.size();
+
+  return nullptr;
+}
+
+PJRT_Error *
+onDeviceDescriptionToString(PJRT_DeviceDescription_ToString_Args *args) {
+  ZoneScoped;
+  DLOG_F(LOG_DEBUG, "DeviceDescription::PJRT_DeviceDescription_ToString");
+
+  const std::string &description_str =
+      DeviceDescription::unwrap(args->device_description)->toString();
+
+  args->to_string = description_str.data();
+  args->to_string_size = description_str.size();
+
+  return nullptr;
+}
+
+} // namespace internal
+
+} // namespace tt::pjrt

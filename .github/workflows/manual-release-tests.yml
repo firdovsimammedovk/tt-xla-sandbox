@@ -1,0 +1,41 @@
+name: Manual release tests
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  id-token: write
+  packages: write
+  checks: write
+  contents: write
+
+jobs:
+  build-image:
+    uses: ./.github/workflows/call-build-docker.yml
+    secrets: inherit
+    with:
+      dockbuild: "all"
+
+  build-ttxla:
+    uses: ./.github/workflows/call-build.yml
+    name: "Build tt-xla"
+    secrets: inherit
+    needs: build-image
+    with:
+      docker_image: ${{ needs.build-image.outputs.docker-image }}
+      docker_image_manylinux: ${{ needs.build-image.outputs.docker-image-manylinux }}
+      build_types: 'release,manylinux'
+
+  build-and-test-release-docker:
+    uses: ./.github/workflows/call-build-and-test-release-docker.yml
+    needs: [ build-ttxla ]
+    secrets: inherit
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [ "ubuntu", "fedora" ]
+    with:
+      wheel_release_artifact_run_id: ${{ needs.build-ttxla.outputs.artifacts_run_id }}
+      wheel_release_artifact_name: xla-whl-manylinux${{ needs.build-ttxla.outputs.artifact_suffix }}
+      wheel_release_vllm_tt_artifact_name: vllm-tt-whl-release${{ needs.build-ttxla.outputs.artifact_suffix }}

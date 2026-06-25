@@ -1,0 +1,90 @@
+# SPDX-FileCopyrightText: © 2024 Tenstorrent AI ULC
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+# This file incorporates work covered by the following copyright and permission notice:
+# SPDX-FileCopyrightText: Copyright 2023 The IREE Authors
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# https://llvm.org/LICENSE.txt
+
+# ----- TTPJRTApi -----
+# Static lib containing core PJRT API implementation: handling device/client/buffer/etc.
+# Depends on: TTMLIRCompiler, TTMLIRRuntime, TTPJRTUtils, coverage_config, protobuf::libprotobuf
+
+find_package(Protobuf REQUIRED)
+
+add_library(TTPJRTApi
+    "buffer_instance.cc"
+    "client_instance.cc"
+    "device_description.cc"
+    "device_instance.cc"
+    "error_instance.cc"
+    "event_instance.cc"
+    "executable_image.cc"
+    "executable_instance.cc"
+    "loaded_executable_instance.cc"
+    "flatbuffer_loaded_executable_instance.cc"
+    "so_loaded_executable_instance.cc"
+    "memory_instance.cc"
+    "compile_options.cc"
+    "compile_options_parser.cc"
+    "module_builder/frontend_passes/shlo_clean_for_xla_ingestion.cc"
+    "module_builder/frontend_passes/shlo_input_role_propagation.cc"
+    "module_builder/frontend_passes/shlo_set_proper_sdy_mesh_attribute.cc"
+    "module_builder/module_builder.cc"
+    "plugin_attributes.cc"
+    "serialized_executable_instance.cc"
+    "tensor.cc"
+    "tensor_pool.cc"
+)
+
+target_include_directories(TTPJRTApi
+PRIVATE
+    # Includes used in .cpp files.
+
+    # Used for tracy zones in PJRT.
+    ${PROJECT_SOURCE_DIR}/third_party/tt-mlir/src/tt-mlir/third_party/tt-metal/src/tt-metal/tt_metal/third_party/tracy/public
+PUBLIC
+    # Includes used in public headers.
+    ${PROJECT_SOURCE_DIR}/pjrt_implementation/inc
+    ${TTMLIR_TOOLCHAIN_DIR}/src/shardy
+    ${TTMLIR_TOOLCHAIN_DIR}/src/stablehlo
+    ${TTMLIR_TOOLCHAIN_DIR}/include
+    ${PROJECT_SOURCE_DIR}/third_party/tt-mlir/install/include
+)
+
+target_link_libraries(TTPJRTApi
+PRIVATE
+    dl
+    coverage_config
+    protobuf::libprotobuf
+    TTMLIRCompiler
+    TTMLIRRuntime
+PUBLIC
+    TTPJRTUtils
+)
+
+if(TTXLA_ENABLE_EMITPY_EXECUTION)
+    target_link_libraries(TTPJRTApi PRIVATE tt-alchemist-python-runner)
+endif()
+
+target_compile_definitions(TTPJRTApi PRIVATE
+    TTXLA_ENABLE_EMITPY_EXECUTION=$<BOOL:${TTXLA_ENABLE_EMITPY_EXECUTION}>
+    TT_RUNTIME_DEBUG=$<BOOL:${TT_RUNTIME_DEBUG}>
+)
+
+# Enable Tracy profiling if requested
+if(TTXLA_TRACY_ZONES)
+    # Define TRACY_ENABLE to enable Tracy zones in the code - this is used in `tracy` headers.
+    target_compile_definitions(TTPJRTApi PUBLIC TRACY_ENABLE)
+    target_link_libraries(TTPJRTApi PUBLIC tracy)
+    message(STATUS "PJRT tracy zones enabled")
+endif()
+
+target_link_directories(TTPJRTApi PUBLIC
+    ${TTMLIR_LIB_DIR}
+)
+
+set_target_properties(TTPJRTApi PROPERTIES
+    UNIT_TESTS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/unit_tests"
+)

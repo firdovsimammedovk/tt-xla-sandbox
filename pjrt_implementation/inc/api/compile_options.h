@@ -1,0 +1,192 @@
+// SPDX-FileCopyrightText: (c) 2025 Tenstorrent AI ULC
+//
+// SPDX-License-Identifier: Apache-2.0
+
+#ifndef TT_XLA_PJRT_IMPLEMENTATION_INC_API_COMPILE_OPTIONS_H_
+#define TT_XLA_PJRT_IMPLEMENTATION_INC_API_COMPILE_OPTIONS_H_
+
+// c++ standard library includes
+#include <optional>
+#include <string>
+#include <unordered_map>
+
+namespace tt::pjrt {
+
+// Enumeration for backend types
+enum class BackendRuntime {
+  // Targets tt-mlir TTNN runtime to execute the compiled flatbuffer.
+  TTNNFlatbuffer,
+
+  // Generates TTNN C++ code to be compiled and executed.
+  TTNNCodegenCpp,
+
+  // Generates TTNN Python code.
+  TTNNCodegenPy
+};
+
+// POD struct containing various options used to customize module compilation.
+struct CompileOptions {
+
+  // Map the key used to store and retrieve the optimization level
+  static inline const std::string optimization_level_key = "optimization_level";
+
+  // Optimization level (0, 1, or 2) that controls multiple optimization passes.
+  // See documentation for details on what each level enables.
+  // Level 0 (default): All optimizations disabled
+  // Level 1: Basic optimizations (optimizer + Conv2d fusion)
+  // Level 2: Advanced optimizations (optimizer + memory layout + Conv2d fusion)
+  int optimization_level = 0;
+
+  // Target dtype for weight conversion in matmul and linear operations.
+  // Valid values: "bfp_bf8", "bfp_bf4". Empty string disables.
+  std::string experimental_weight_dtype = "";
+
+  // Enables experimental KV cache dtype override.
+  std::optional<std::string> experimental_kv_cache_dtype = std::nullopt;
+
+  // Override math fidelity for all ttnn operations exposing compute kernel
+  // config. Valid values: "lofi", "hifi2", "hifi3", "hifi4", "ttnn_default".
+  // "ttnn_default" - means that we don't override math_fidelity in comiler,
+  // and let ttnn choose math_fidelity for each operation based on its own
+  // logic. If math_fidelity not set (nullopt), the default behavior from MLIR
+  // is used. Currently, MLIR default is HiFi4 for all operations.
+  std::optional<std::string> math_fidelity = std::nullopt;
+
+  // Override fp32 destination accumulation for all ttnn operations exposing
+  // compute kernel config. If not set (nullopt), the default behavior from
+  // MLIR is used. Currently, MLIR default is true for all operations.
+  std::optional<bool> fp32_dest_acc_en = std::nullopt;
+
+  // Enables Conv2d fusion with multiply pattern in the TTNN fusing pass.
+  // TODO(sdjordjevicTT): This is a temporary option and will be removed once
+  // the underlying issue https://github.com/tenstorrent/tt-mlir/issues/4628 is
+  // fixed.
+  bool experimental_enable_fusing_conv2d_with_multiply_pattern = false;
+
+  // Backend runtime which should be targeted for compilation and execution.
+  BackendRuntime backend = BackendRuntime::TTNNFlatbuffer;
+
+  // Enables trace hoisting for TTNN pipeline.
+  // This is supported only when all non-consteval ops are on device.
+  // This is a performance optimization feature that will eliminate
+  // host overhead for creating and dispatching operations
+  // that are repeated multiple times.
+  bool enable_trace = false;
+
+  // Enables saving graph inputs to disk whenever Execute() is called.
+  // This is useful for chisel and codegen.
+  bool export_tensors = false;
+
+  // Enables generation of consteval graphs.
+  //
+  // We allow the user of the plugin to toggle consteval in tt-mlir. We would
+  // like for this to be on at all times as it results in a more performant
+  // model. However, the results of the consteval graphs are stored on device
+  // until the device is closed. If multiple graphs use the same weights (i.e,
+  // same model, different input shapes), then we will end up cloning the
+  // weights multiple times. This can easily lead to OOM errors. There is an
+  // issue tracking this in tt-mlir:
+  // https://github.com/tenstorrent/tt-mlir/issues/3888
+  bool enable_const_eval = true;
+
+  // Enables hoisting const-eval subgraphs to CPU module.
+  //
+  // When enabled, const-eval operations are hoisted to be executed on the CPU
+  // instead of being executed on the device. CPU execution uses 32-bit
+  // precision for all operations, which can improve accuracy for some models.
+  bool enable_const_eval_on_cpu = true;
+
+  // Forces const-eval function inputs to be annotated as system memory in
+  // the executable's expected layout.
+  //
+  // ON  (default): consteval inputs stay on host RAM, cached outputs on
+  //                device DRAM. The host-side staging is held for the
+  //                BufferInstance's full lifetime (ensure_layout sees the
+  //                source already on host and skips migration).
+  //
+  // OFF:           consteval inputs migrate to device DRAM on first use,
+  //                so the host-side staging can be released between
+  //                stages. Useful for staged-load workloads (e.g. layer-
+  //                by-layer ship) where host data must be freed between
+  //                stages, at the cost of holding both inputs and cached
+  //                outputs on device DRAM.
+  bool enable_const_eval_inputs_to_system_memory = true;
+
+  // Enables transpose + matmul and transpose + linear ops fusion.
+  // This controls fusing of transpose + matmul and transpose + linear ops.
+  // When disabled, transpose is kept as a separate op which can be constevaled,
+  // potentially improving performance. However, this may cause OOM errors on
+  // some models until https://github.com/tenstorrent/tt-mlir/pull/6198 lands.
+  bool experimental_enable_permute_matmul_fusion = true;
+
+  // Enable DRAM space saving optimization pass (TTNNMemoryManagement).
+  bool experimental_enable_dram_space_saving_optimization = false;
+
+  // Enable D2M subgraph creation pass for d2m elementwise fusion.
+  // Only effective when optimization_level >= 1 (optimizer must be enabled)
+  bool enable_create_d2m_subgraphs = false;
+
+  // Enable collection of TTNN performance metrics during execution.
+  bool ttnn_perf_metrics_enabled = false;
+
+  // Enable the all_reduce decomposition workaround which breaks all_reduce down
+  // into reduce_scatter + all_gather (or all_gather + local reduce).
+  bool all_reduce_workaround_enabled = true;
+
+  // Enables "try to recover structure" option for TTNN IR. Tries to match the
+  // structure of the original graph. This generates a more readable solution,
+  // useful when generating code.
+  bool codegen_try_recover_structure = false;
+
+  // Enables splitting codegen output into separate files.
+  bool codegen_split_files = false;
+
+  // Output file path for TTNN performance metrics.
+  // If empty, metrics will be saved to the "perf_metrics" directory with a
+  // default name.
+  std::string ttnn_perf_metrics_output_file = "";
+
+  // Perform everything as if the graph was executed, but don't actually execute
+  // it. Instead, return zero-filled output buffers. Useful for just getting the
+  // IRs out, or input tensors, or codegen code. Default true for codegen
+  // backends, false for flatbuffer backend.
+  bool dry_run = true;
+
+  // Path that will contain any exported artifacts.
+  // This includes: codegen solutions, graph inputs and intermediate IRs.
+  // Setting this will enable IR dumping.
+  std::optional<std::string> export_path = std::nullopt;
+
+  // Model name/identifier for exported file names (e.g., blk_phi1_bs32_a7f3).
+  // The graph number (g0, g1, etc.) is automatically appended.
+  std::string export_model_name = "";
+
+  static CompileOptions
+  parse(const std::unordered_map<std::string, std::string> &compile_options);
+};
+
+namespace internal {
+
+// Parse out the value of one specific boolean flag from the options map.
+std::optional<bool> parseBoolOption(
+    const std::unordered_map<std::string, std::string> &compile_options,
+    const std::string &option_name);
+
+// Parse backend option from string to enum
+std::optional<BackendRuntime> parseBackendOption(
+    const std::unordered_map<std::string, std::string> &compile_options,
+    const std::string &option_name);
+
+std::optional<std::string> parseStringOption(
+    const std::unordered_map<std::string, std::string> &compile_options,
+    const std::string &option_name);
+
+std::optional<int> parseIntOption(
+    const std::unordered_map<std::string, std::string> &compile_options,
+    const std::string &option_name);
+
+} // namespace internal
+
+} // namespace tt::pjrt
+
+#endif // TT_XLA_PJRT_IMPLEMENTATION_INC_API_COMPILE_OPTIONS_H_

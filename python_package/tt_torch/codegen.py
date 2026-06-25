@@ -1,0 +1,79 @@
+# SPDX-FileCopyrightText: (c) 2025 Tenstorrent AI ULC
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Helper functions for Codegen(EmitC/EmitPy) specific to Torch.
+"""
+
+from typing import Callable
+
+import torch
+import torch.nn as nn
+import torch_xla
+import torch_xla.core.xla_model as xm
+import torch_xla.runtime as xr
+
+# Set up XLA runtime for TT backend.
+xr.set_device_type("TT")
+
+
+def codegen_py(
+    model: nn.Module,
+    *args,
+    compiler_options: dict = {},
+    export_path: str = "codegen_result",
+    export_tensors: bool = True,
+    **kwargs,
+):
+    real_compile_options = {
+        **compiler_options,
+        "backend": "codegen_py",
+        "export_path": export_path,
+        "export_tensors": export_tensors,
+    }
+    torch_xla.set_custom_compile_options(real_compile_options)
+    device = xm.xla_device()
+    # Using legacy compile is a temporary hack to 1) Make MetaDataProp work 2) Decrease odds of codegenning for graphs that never need to get executed.
+    # Example of 2) happening to us is https://github.com/tenstorrent/tt-xla/issues/2139
+    # New compile serves to primarily reduce execution overhead, which we don't really care about if executing only once for codegen.
+    # TODO(sgligorijevic): Clean this up
+    model.compile(backend="tt", options={"tt_legacy_compile": True})
+    model = model.to(device)
+    args = [arg.to(device) for arg in args if isinstance(arg, torch.Tensor)]
+    kwargs = {k: v.to(device) for k, v in kwargs.items() if isinstance(v, torch.Tensor)}
+    output = model(*args, **kwargs)
+    # Wait for all device operations to complete before returning
+    # This ensures codegen files are fully written
+    xm.wait_device_ops()
+    return None
+
+
+def codegen_cpp(
+    model: nn.Module,
+    *args,
+    compiler_options: dict = {},
+    export_path: str = "codegen_result",
+    export_tensors: bool = True,
+    **kwargs,
+):
+    real_compile_options = {
+        **compiler_options,
+        "backend": "codegen_cpp",
+        "export_path": export_path,
+        "export_tensors": export_tensors,
+    }
+    torch_xla.set_custom_compile_options(real_compile_options)
+    device = xm.xla_device()
+    # Using legacy compile is a temporary hack to 1) Make MetaDataProp work 2) Decrease odds of codegenning for graphs that never need to get executed.
+    # New compile serves to primarily reduce execution overhead, which we don't really care about if executing only once for codegen.
+    # TODO(sgligorijevic): Clean this up
+    model.compile(backend="tt", options={"tt_legacy_compile": True})
+    model = model.to(device)
+    args = [arg.to(device) for arg in args if isinstance(arg, torch.Tensor)]
+    kwargs = {k: v.to(device) for k, v in kwargs.items() if isinstance(v, torch.Tensor)}
+    output = model(*args, **kwargs)
+    # Wait for all device operations to complete before returning
+    # This ensures codegen files are fully written
+    xm.wait_device_ops()
+    return None

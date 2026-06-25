@@ -1,0 +1,517 @@
+# SPDX-FileCopyrightText: (c) 2025 Tenstorrent AI ULC
+#
+# SPDX-License-Identifier: Apache-2.0
+import os
+from pathlib import Path
+
+import numpy as np
+import pytest
+import torch
+import torch_xla.core.xla_model as xm
+import torch_xla.distributed.spmd as xs
+import torch_xla.runtime as xr
+from infra import Framework, run_op_test
+from infra.evaluators import TorchComparisonEvaluator
+from infra.utilities.torch_multichip_utils import get_mesh
+from infra.workloads import TorchWorkload
+from torch_xla.distributed.spmd import Mesh
+from tt_torch.sharding import sharding_constraint_hook
+from ttxla_tools.serialization import save_system_descriptor_to_disk
+
+from tests.infra import ComparisonConfig
+from tests.infra.evaluators.evaluation_config import AtolConfig, ComparisonConfig
+from tests.infra.testers.single_chip.op.op_tester import OpTester
+
+# TODO(@LPanosTT): https://github.com/tenstorrent/tt-xla/issues/1137
+# We would like to use the OpTester/GraphTester infra instead of manually
+# calculating and comparing golden vs device results.
+
+
+@pytest.mark.push
+@pytest.mark.single_device
+@pytest.mark.parametrize("bias", [True, False])
+def test_simple_mm_eager(bias):
+    class MM(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(32, 32, bias=bias, dtype=torch.bfloat16)
+
+        def forward(self, x):
+            return self.linear(x)
+
+    input_x = torch.randn(32, 32, dtype=torch.bfloat16)
+
+    model = MM()
+    golden = model(input_x)
+
+    device = xm.xla_device()
+    model = model.to(device)
+    input_x = input_x.to(device)
+
+    output = model(input_x).to("cpu")
+
+    comparator = TorchComparisonEvaluator(
+        ComparisonConfig(
+            atol=AtolConfig(required_atol=0.02),
+        )
+    )
+    comparator.evaluate(output, golden)
+
+
+@pytest.mark.push
+@pytest.mark.single_device
+@pytest.mark.parametrize("in_channels", [3, 64])
+@pytest.mark.parametrize("out_channels", [3, 64])
+@pytest.mark.parametrize("kernel_size", [2, 3])
+@pytest.mark.parametrize("stride", [1, 2])
+@pytest.mark.parametrize("padding", [0, 1])
+@pytest.mark.parametrize("dilation", [1, 2])
+@pytest.mark.parametrize("bias", [True, False])
+def test_conv2d_eager(
+    in_channels, out_channels, kernel_size, stride, padding, dilation, bias
+):
+    class Conv(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = torch.nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+                1,
+                bias,
+                dtype=torch.bfloat16,
+            )
+
+        def forward(self, x):
+            return self.conv(x)
+
+    input_x = torch.randn(1, in_channels, 224, 224, dtype=torch.bfloat16)
+
+    model = Conv()
+    golden = model(input_x)
+
+    device = xm.xla_device()
+    model = model.to(device)
+    input_x = input_x.to(device)
+
+    output = model(input_x).to("cpu")
+
+    comparator = TorchComparisonEvaluator(
+        ComparisonConfig(
+            atol=AtolConfig(enabled=False, required_atol=0.02),
+        )
+    )
+    comparator.evaluate(output, golden)
+
+
+eltwise_unary_ops = [
+    torch.abs,
+    torch.acos,
+    torch.acosh,
+    torch.angle,
+    torch.asin,
+    torch.asinh,
+    torch.atan,
+    torch.atanh,
+    torch.bitwise_not,
+    torch.ceil,
+    lambda act: torch.clamp(act, -1, 1),  # needs min and max
+    torch.conj_physical,
+    torch.cos,
+    torch.cosh,
+    torch.deg2rad,
+    torch.digamma,
+    torch.erf,
+    torch.erfc,
+    torch.erfinv,
+    torch.exp,
+    torch.exp2,
+    torch.expm1,
+    torch.fix,
+    torch.floor,
+    torch.frac,
+    torch.lgamma,
+    torch.log,
+    torch.log10,
+    torch.log1p,
+    torch.log2,
+    torch.logit,
+    torch.i0,
+    torch.isnan,
+    torch.nan_to_num,
+    torch.neg,
+    torch.negative,
+    torch.positive,
+    torch.rad2deg,
+    torch.reciprocal,
+    # torch.round, error: failed to legalize operation 'stablehlo.round_nearest_even'
+    torch.rsqrt,
+    torch.sigmoid,
+    torch.sign,
+    torch.sgn,
+    torch.signbit,
+    torch.sin,
+    torch.sinc,
+    torch.sinh,
+    torch.sqrt,
+    torch.square,
+    torch.tan,
+    torch.tanh,
+    torch.trunc,
+]
+
+# Operations that fail only in eager mode due to different nan/inf handling
+eager_failing_unary_ops = {
+    torch.acos,
+    torch.acosh,
+    torch.asin,
+    torch.atanh,
+    torch.digamma,
+    torch.erfinv,
+    torch.log,
+    torch.log10,
+    torch.log1p,
+    torch.log2,
+    torch.logit,
+    torch.rsqrt,
+    torch.sqrt,
+}
+
+# Create eager version with xfail markers for failing ops
+eltwise_unary_ops_eager = [
+    (
+        pytest.param(
+            op,
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason="PCC comparison failed see issue https://github.com/tenstorrent/tt-xla/issues/1555",
+            ),
+        )
+        if op in eager_failing_unary_ops
+        else op
+    )
+    for op in eltwise_unary_ops
+]
+
+
+@pytest.mark.push
+@pytest.mark.single_device
+@pytest.mark.parametrize("op", eltwise_unary_ops_eager)
+def test_eltwise_unary_eager(op):
+    class Unary(torch.nn.Module):
+        def forward(self, x):
+            return op(x)
+
+    input_x = (
+        torch.randn(32, 32, dtype=torch.bfloat16)
+        if op is not torch.bitwise_not
+        else torch.randint(-100, 100, (32, 32))
+    )
+
+    model = Unary()
+    golden = model(input_x)
+
+    device = xm.xla_device()
+    model = model.to(device)
+    input_x = input_x.to(device)
+
+    output = model(input_x).to("cpu")
+
+    # Not verifying data as many are wrong. Simply testing compile and execute
+    comparator = TorchComparisonEvaluator(
+        ComparisonConfig(
+            atol=AtolConfig(enabled=False, required_atol=0.01),
+        )
+    )
+    comparator.evaluate(output, golden)
+
+
+eltwise_binary_ops = [
+    torch.add,
+    torch.atan2,
+    torch.arctan2,
+    torch.bitwise_and,
+    torch.bitwise_or,
+    torch.bitwise_xor,
+    torch.bitwise_left_shift,
+    torch.bitwise_right_shift,
+    torch.div,
+    torch.divide,
+    pytest.param(
+        torch.floor_divide,
+        marks=pytest.mark.xfail(
+            strict=True,
+            reason="PCC comparison failed see issue https://github.com/tenstorrent/tt-xla/issues/1555",
+        ),
+    ),
+    pytest.param(
+        torch.fmod,
+        marks=pytest.mark.xfail(
+            strict=True,
+            reason="PCC comparison failed see issue https://github.com/tenstorrent/tt-xla/issues/1555",
+        ),
+    ),
+    torch.logaddexp,
+    torch.logaddexp2,
+    torch.mul,
+    torch.multiply,
+    torch.nextafter,
+    pytest.param(
+        torch.remainder,
+        marks=pytest.mark.xfail(
+            strict=True,
+            reason="PCC comparison failed see issue https://github.com/tenstorrent/tt-xla/issues/1555",
+        ),
+    ),
+    torch.sub,
+    torch.subtract,
+    torch.true_divide,
+    torch.eq,
+    torch.ne,
+    torch.le,
+    torch.ge,
+    torch.greater,
+    torch.greater_equal,
+    torch.gt,
+    torch.less_equal,
+    torch.lt,
+    torch.less,
+    torch.maximum,
+    torch.minimum,
+    torch.fmax,
+    torch.fmin,
+    torch.not_equal,
+]
+
+
+@pytest.mark.push
+@pytest.mark.single_device
+@pytest.mark.parametrize("op", eltwise_binary_ops)
+def test_eltwise_binary_eager(op):
+    if op in [
+        torch.bitwise_and,
+        torch.bitwise_or,
+        torch.bitwise_xor,
+    ]:
+        input_x = torch.randint(-100, 100, (32, 32))
+        input_y = torch.randint(-100, 100, (32, 32))
+    elif op in [torch.bitwise_left_shift, torch.bitwise_right_shift]:
+        # TODO: enable test for these ops once issues is resolved (https://github.com/tenstorrent/tt-torch/issues/1127)
+        pytest.skip(f"{op} not supported in tt backend yet. Skipping test.")
+    else:
+        input_x = torch.randn(32, 32, dtype=torch.bfloat16)
+        input_y = torch.randn(32, 32, dtype=torch.bfloat16)
+
+    class Binary(torch.nn.Module):
+        def forward(self, x, y):
+            return op(x, y)
+
+    model = Binary()
+    golden = model(input_x, input_y)
+
+    device = xm.xla_device()
+    model = model.to(device)
+    input_x = input_x.to(device)
+    input_y = input_y.to(device)
+
+    output = model(input_x, input_y).to("cpu")
+
+    # Not verifying data as many are wrong. Simply testing compile and execute
+    comparator = TorchComparisonEvaluator(
+        ComparisonConfig(
+            atol=AtolConfig(enabled=False, required_atol=0.02),
+        )
+    )
+    comparator.evaluate(output, golden)
+
+
+@pytest.mark.single_device
+@pytest.mark.parametrize("spmd_mode", [True, False])
+def test_fully_replicated_graph(spmd_mode):
+    if spmd_mode:
+        xr.use_spmd()
+    else:
+        # There is no official way to unset SPMD mode in torch_xla.
+        # So this is a workaround to delete the env var and reset the state.
+        if os.environ.get("XLA_USE_SPMD") is not None:
+            del os.environ["XLA_USE_SPMD"]
+
+    class MM(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+
+        def forward(self, x, y):
+            return x @ y
+
+    input_x = torch.randn(32, 32, dtype=torch.bfloat16)
+    input_y = torch.randn(32, 32, dtype=torch.bfloat16)
+    model = MM()
+    golden = model(input_x, input_y)
+
+    device = xm.xla_device()
+    model = model.to(device)
+    input_x = input_x.to(device)
+    input_y = input_y.to(device)
+    output = model(input_x, input_y).to("cpu")
+    comparator = TorchComparisonEvaluator(
+        ComparisonConfig(
+            atol=AtolConfig(enabled=False, required_atol=0.02),
+        )
+    )
+
+    comparator.evaluate(output, golden)
+
+
+@pytest.mark.nightly
+@pytest.mark.push
+@pytest.mark.dual_chip
+@pytest.mark.parametrize("axis_names", [("x", "y")])
+@pytest.mark.parametrize("input_shape", [(32, 32)])
+@pytest.mark.parametrize("sharding_mode", ["fully_replicated", "partially_sharded"])
+def test_spmd_sharding(axis_names, input_shape, sharding_mode):
+    class LinearModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(32, 256, bias=False)
+
+        def forward(self, x):
+            return self.linear(x)
+
+    def shard_spec_function(model):
+        if sharding_mode == "partially_sharded":
+            # Shard weight matrix along output dimension (dim 0)
+            return {model.linear.weight: ("y", None)}
+        else:
+            # Do not shard anything, fully replicated
+            return {}
+
+    def setup_mesh(mesh_shape, axis_names):
+        device_ids = np.arange(np.prod(mesh_shape))
+        mesh = Mesh(device_ids=device_ids, mesh_shape=mesh_shape, axis_names=axis_names)
+        return mesh
+
+    inputs = torch.randn(input_shape)
+
+    mesh_shape = (1, xr.global_runtime_device_count())
+    mesh = setup_mesh(mesh_shape, axis_names)
+    comparison_config = ComparisonConfig()
+
+    run_op_test(
+        LinearModel(),
+        [inputs],
+        framework=Framework.TORCH,
+        comparison_config=comparison_config,
+        mesh=mesh,
+        shard_spec_fn=shard_spec_function,
+    )
+
+
+@pytest.mark.nightly
+@pytest.mark.push
+@pytest.mark.llmbox
+@pytest.mark.filecheck(["sharding_constraints.ttir.mlir"])
+def test_spmd_sharding_constraints(request):
+
+    class EmbeddingModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embedding = torch.nn.Embedding(1000, 512)
+            self.norm = torch.nn.RMSNorm(512)
+
+        def forward(self, x):
+            return self.norm(self.embedding(x))
+
+    num_batches = 2
+    mesh_shape = (2, xr.global_runtime_device_count() // 2)
+    device_ids = np.array(range(xr.global_runtime_device_count()))
+    mesh = Mesh(device_ids, mesh_shape, ("batch", "model"))
+
+    inputs = torch.randint(0, 1000, (num_batches, 32))
+
+    def shard_spec_function(model, args, kwargs):
+        shard_specs = {}
+        shard_specs[args[0]] = ("batch", None)
+        shard_specs[model.embedding.weight] = (None, "model")
+        return shard_specs
+
+    model = EmbeddingModel()
+    hook = sharding_constraint_hook(model.embedding, mesh, ("batch", None, None))
+    model.embedding.register_forward_hook(hook)
+
+    tester = OpTester(framework=Framework.TORCH)
+    workload = TorchWorkload(
+        model=model,
+        args=[inputs],
+        mesh=mesh,
+        shard_spec_fn=shard_spec_function,
+    )
+    tester.test(workload, request=request)
+
+
+@pytest.mark.nightly
+@pytest.mark.bh_galaxy
+def test_megatron_mlp_tensor_parallel():
+    class MegatronMLP(torch.nn.Module):
+        def __init__(self, hidden, ffn, dtype=torch.bfloat16):
+            super().__init__()
+            # Column-parallel weight: [hidden, ffn]
+            self.w1 = torch.nn.Parameter(torch.randn(hidden, ffn, dtype=dtype))
+            # Row-parallel weight: [ffn, hidden]
+            self.w2 = torch.nn.Parameter(torch.randn(ffn, hidden, dtype=dtype))
+
+        def forward(self, x):
+            h = torch.matmul(x, self.w1)  # column-parallel matmul
+            return torch.matmul(h, self.w2)  # row-parallel matmul -> all-reduce
+
+    num_devices = xr.global_runtime_device_count()
+    assert (
+        num_devices == 32
+    ), f"This test targets a single blackhole galaxy (32 devices), got {num_devices}."
+
+    mesh_shape = (4, 8)
+    mesh = get_mesh(mesh_shape, ("batch", "model"))
+
+    dtype = torch.bfloat16
+    # ffn must be divisible by the "model" axis size (8) for even sharding.
+    batch, hidden, ffn = 32, 64, 128
+    model = MegatronMLP(hidden, ffn, dtype=dtype)
+
+    def get_shard_spec(model, args, kwargs):
+        # Shard only along the "model" axis; "batch" stays replicated.
+        return {
+            model.w1: (None, "model"),  # column-parallel (shard output dim)
+            model.w2: ("model", None),  # row-parallel (shard contraction dim)
+        }
+
+    activation = torch.randn(batch, hidden, dtype=dtype)
+
+    run_op_test(
+        model,
+        [activation],
+        framework=Framework.TORCH,
+        comparison_config=ComparisonConfig(),
+        mesh=mesh,
+        shard_spec_fn=get_shard_spec,
+    )
+
+
+@pytest.mark.push
+@pytest.mark.single_device
+def test_save_system_descriptor_to_disk(tmp_path):
+    device = xm.xla_device()
+
+    x = torch.randn(2, 2, device=device)
+    y = x + 1
+    xm.mark_step()
+
+    output_prefix = str(tmp_path / "test_system_desc")
+    save_system_descriptor_to_disk(output_prefix, as_json=False)
+
+    system_desc_path = Path(f"{output_prefix}_system_desc.ttsys")
+    assert (
+        system_desc_path.exists()
+    ), f"System descriptor binary file not created at {system_desc_path}"
+    assert system_desc_path.stat().st_size > 0, "System descriptor binary file is empty"

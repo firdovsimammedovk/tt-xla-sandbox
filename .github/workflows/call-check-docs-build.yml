@@ -1,0 +1,46 @@
+
+# This workflow builds the project documentation using a specified Docker image to verify docs build correctly.
+# It does not deploy the docs - use call-build-and-deploy-docs.yml for deployment.
+
+name: Build Docs
+
+on:
+  workflow_call:
+    inputs:
+      docker_image:
+        description: 'Docker image to use for build'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+  checks: write
+
+jobs:
+
+  build-docs:
+    runs-on: ubuntu-latest
+
+    container:
+      image: ${{ inputs.docker_image }}
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: recursive
+        fetch-depth: 0
+
+    - name: Set reusable strings
+      id: strings
+      shell: bash
+      run: |
+        echo "work-dir=$(pwd)" >> "$GITHUB_OUTPUT"
+
+    - name: Git safe dir
+      run: git config --global --add safe.directory ${{ steps.strings.outputs.work-dir }}
+
+    - name: Build Docs
+      shell: bash
+      run: |
+        bash docs/build_docs.sh

@@ -1,0 +1,785 @@
+# SPDX-FileCopyrightText: (c) 2024 Tenstorrent AI ULC
+#
+# SPDX-License-Identifier: Apache-2.0
+
+import contextlib
+import ctypes
+import gc
+import io
+import os
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from contextlib import contextmanager
+from pathlib import Path
+
+import psutil
+import pytest
+import torch
+import torch_xla.runtime as xr
+from infra import DeviceConnectorFactory, Framework
+from loguru import logger
+
+from third_party.tt_forge_models.config import ModelInfo
+
+COMMIT_HASH_LOG_ENV_VAR = "TT_XLA_LOG_COMMIT_HASHES"
+
+
+def _get_commit(repo_path: Path) -> str:
+    """Return HEAD commit hash for repo_path, or a human-readable fallback."""
+    if not repo_path.is_dir():
+        return "N/A (path not present)"
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=os.fspath(repo_path),
+            text=True,
+        ).strip()
+    except subprocess.CalledProcessError:
+        return "Not a git repository"
+
+
+def _log_repo_commits(project_root: Path) -> None:
+    """Log commit hashes for tt-xla and its pinned third_party repos."""
+    tt_mlir = project_root / "third_party" / "tt-mlir" / "src" / "tt-mlir"
+    tt_metal = tt_mlir / "third_party" / "tt-metal" / "src" / "tt-metal"
+    logger.info(f"tt-xla commit: {_get_commit(project_root)}")
+    logger.info(f"tt-mlir commit: {_get_commit(tt_mlir)}")
+    logger.info(f"tt-metal commit: {_get_commit(tt_metal)}")
+
+
+def pytest_sessionstart(session: pytest.Session):
+    """Optionally log repository commit hashes once at pytest session start."""
+    del session  # unused hook arg
+    if os.environ.get(COMMIT_HASH_LOG_ENV_VAR, "0") != "1":
+        return
+    project_root = Path(__file__).resolve().parent.parent
+    _log_repo_commits(project_root)
+
+
+def pytest_configure(config: pytest.Config):
+    """
+    Registers custom pytest marker `record_test_properties(key1=val1, key2=val2, ...)`.
+
+    Allowed keys are:
+        - Every test:
+            - `category`: utils.Category
+
+        - Op tests:
+            - `jax_op_name`: name of the operation in jax, e.g. `jax.numpy.exp`
+            - `torch_op_name`: name of the operation in torch, e.g. `torch.add`
+            - `shlo_op_name`: name of the matching stablehlo operation
+
+        - Model tests:
+            - `model_name`: name of the model under test
+            - 'model_group': utils.ModelGroup
+            - `model_info`: third_party.tt_forge_models.config.ModelInfo
+            - `run_mode`: infra.RunMode
+            - `parallelism`: third_party.tt_forge_models.config.Parallelism
+            - `bringup_status`: utils.BringupStatus
+            - `pcc`: float
+            - `atol`: float
+
+    These are used to tag the function under test with properties which will be dumped
+    to the final XML test report. These reports get picked up by other CI workflows and
+    are used to display state of tests on a dashboard.
+    """
+    config.addinivalue_line(
+        "markers",
+        "record_test_properties(key_value_pairs): Record custom properties for the test",
+    )
+
+    """
+    Register a marker to disable auto user_properties injection at collection time, when they
+    would otherwise be populated at runtime.
+    """
+    config.addinivalue_line(
+        "markers",
+        "no_auto_properties: disable auto user_properties injection at collection",
+    )
+
+
+def pytest_collection_modifyitems(items):
+    """
+    Pytest hook to process the custom marker and attach recorder properties to the test.
+    Also filters tests based on .pytest_tests_to_run file if it exists.
+    """
+
+    def validate_keys(keys: dict, tagged_as_model_test: bool):
+        valid_keys = [
+            "category",
+            "jax_op_name",
+            "torch_op_name",
+            "shlo_op_name",
+            "model_name",
+            "model_group",
+            "model_info",
+            "run_mode",
+            "parallelism",
+            "bringup_status",
+            "execution_pass",
+            "pcc",
+            "atol",
+        ]
+
+        # Check that only valid keys are used.
+        if not all(key in valid_keys for key in keys):
+            raise KeyError(
+                f"Invalid keys found in 'record_test_properties' marker: {', '.join(keys)}. "
+                f"Allowed keys are: {', '.join(valid_keys)}"
+            )
+
+        # If model test, check all necessary properties are provided.
+        if tagged_as_model_test:
+            # Check if using new property set
+            new_mandatory_properties = [
+                "model_info",
+                "run_mode",
+                "bringup_status",
+            ]
+
+            # Check if using old property set
+            old_mandatory_properties = [
+                "model_name",
+                "model_group",
+                "run_mode",
+                "bringup_status",
+            ]
+
+            has_new_properties = all(prop in keys for prop in new_mandatory_properties)
+            has_old_properties = all(prop in keys for prop in old_mandatory_properties)
+
+            # Ensure exactly one property set is used (XOR condition)
+            if has_new_properties == has_old_properties:
+                raise KeyError(
+                    f"Model tests must have either new properties: {new_mandatory_properties} "
+                    f"or old properties: {old_mandatory_properties}."
+                )
+
+    # Filter tests based on .pytest_tests_to_run file if it exists
+    tests_to_run_file = Path(".pytest_tests_to_run")
+    if tests_to_run_file.exists():
+        with open(tests_to_run_file, "r") as f:
+            allowed_tests = set(line.strip() for line in f if line.strip())
+
+        # Remove tests not in the allowed list
+        items[:] = [item for item in items if item.nodeid in allowed_tests]
+
+    for item in items:
+
+        # Skip collection-time user_properies for this test, populate at runtime.
+        if item.get_closest_marker("no_auto_properties"):
+            continue
+
+        # Add some test metadata in a 'tags' dictionary.
+        tags = {"test_name": item.originalname, "specific_test_case": item.name}
+
+        # Look for the custom marker.
+        properties_marker = item.get_closest_marker(name="record_test_properties")
+
+        # Utils flags helping handling model tests properly.
+        tagged_as_model_test = False
+        model_group = None
+
+        if properties_marker:
+            # Extract the key-value pairs passed to the marker.
+            properties: dict = properties_marker.kwargs
+
+            # Check if the test is marked using the "model_test" marker.
+            tagged_as_model_test = (
+                item.get_closest_marker(name="model_test") is not None
+            )
+
+            # Validate that only allowed keys are used.
+            validate_keys(properties.keys(), tagged_as_model_test)
+
+            # Put all properties in tags.
+            for key, value in properties.items():
+                if key == "model_info":
+                    model_info: ModelInfo = value
+                    tags["model_name"] = model_info.name
+                    tags["model_info"] = model_info.to_report_dict()
+                    model_group = str(model_info.group)
+                elif key == "model_group":
+                    model_group = str(value)
+                else:
+                    tags[key] = str(value)
+
+        # Attach tags dictionary as a single property. Also set owner.
+        item.user_properties.extend([("tags", tags), ("owner", "tt-xla")])
+        if tagged_as_model_test:
+            # Add model group independently of tags dict.
+            item.user_properties.append(("group", model_group))
+
+
+def pytest_addoption(parser):
+    """
+    Custom CLI pytest options for tests.
+
+    Use it when calling pytest like `pytest --log-memory ...` or `pytest --serialize ...`.
+    """
+    parser.addoption(
+        "--log-memory",
+        action="store_true",
+        default=False,
+        help="Enable memory usage tracking for tests",
+    )
+    parser.addoption(
+        "--serialize",
+        action="store_true",
+        default=False,
+        help="Enable serialization of compilation artifacts during tests",
+    )
+    parser.addoption(
+        "--log-pid",
+        action="store_true",
+        default=False,
+        help="Append process PID to log file names specified in TTXLA_LOGGER_FILE, TT_LOGGER_FILE, TTMLIR_RUNTIME_LOGGER_FILE environment variables if set, to facilitate multiprocess debug logging.",
+    )
+    parser.addoption(
+        "--disable-perf-measurement",
+        action="store_true",
+        default=False,
+        help="Disable performance benchmark measurement in tester",
+    )
+    parser.addoption(
+        "--perf-report-dir",
+        action="store",
+        default=None,
+        help="Output directory for perf benchmark reports. If not given, no perf benchmark files will be generated.",
+    )
+    parser.addoption(
+        "--perf-id",
+        action="store",
+        default=None,
+        help="Perf ID for perf benchmark reports.",
+    )
+    parser.addoption(
+        "--dump-irs",
+        action="store_true",
+        default=False,
+        help="Enable IR dumping during model tests",
+    )
+    parser.addoption(
+        "--enable-chisel",
+        action="store_true",
+        default=False,
+        help="Initialize Chisel context before running tests",
+    )
+
+
+@pytest.fixture(autouse=True)
+def disable_perf_measurement(request):
+    """
+    A pytest fixture that disables performance benchmark measurement if --disable-perf-measurement is passed to pytest.
+    """
+    if request.config.getoption("--disable-perf-measurement"):
+        os.environ["DISABLE_PERF_MEASUREMENT"] = "1"
+
+
+# DOCKER_CACHE_ROOT is only meaningful on CIv1 and its presence indicates CIv1 usage.
+# TODO: Consider using a more explicit way to differentiate CIv2-specific environment
+# Issue: https://github.com/tenstorrent/github-ci-infra/issues/772
+# Users of IRD may not have DOCKER_CACHE_ROOT set locally, but do have IRD_ARCH_NAME
+# set so also consider that variable and expect it not to be set.
+def _is_on_CIv2() -> bool:
+    """
+    Check if we are on CIv2.
+    """
+    if bool(os.environ.get("TT_XLA_CI")):
+        is_on_civ1 = bool(os.environ.get("DOCKER_CACHE_ROOT"))
+        return not is_on_civ1
+
+    # We are not running in CI environment.
+    return False
+
+
+@contextmanager
+def newline_logger():
+    """
+    Context manager to temporarily set the logger to use a newline at the start of each log message.
+    Reverts to the default format after the context exits.
+    """
+    default_format = (
+        "<green>{time:YYYY-MM-DD HH:mm:ss.SSS Z}</green> | "
+        "<level>{level: <8}</level> | "
+        "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
+        "<level>{message}</level>"
+    )
+    logger.remove()
+    logger.add(
+        sys.stdout,
+        format=f"\n{default_format}",
+        level="INFO",
+    )
+    try:
+        yield
+    finally:
+        logger.remove()
+        logger.add(
+            sys.stdout,
+            format=default_format,
+            level="INFO",
+        )
+
+
+@pytest.fixture(autouse=True)
+def setup_pid_logging(request):
+    """
+    A pytest fixture that monkeypatches TTXLA_LOGGER_FILE, TTMLIR_RUNTIME_LOGGER_FILE, and TT_LOGGER_FILE environment
+    variables to include the process PID before the file extension when --log-pid
+    is passed to pytest.
+
+    TT_LOGGER_FILE controls tt-metal's tt-logger log output filepath, see
+    https://github.com/tenstorrent/tt-logger?tab=readme-ov-file#environment-variables
+    for more information about tt-logger.
+
+    TTMLIR_RUNTIME_LOGGER_FILE controls tt-mlir-runtime's logging output filepath.
+    """
+    if not request.config.getoption("--log-pid"):
+        yield
+        return
+
+    # Store original values for restoration
+    original_TTXLA_LOGGER_FILE = os.environ.get("TTXLA_LOGGER_FILE")
+    original_tt_logger_file = os.environ.get("TT_LOGGER_FILE")
+    original_ttmlir_runtime_logger_file = os.environ.get("TTMLIR_RUNTIME_LOGGER_FILE")
+
+    def add_pid_to_filename(filepath):
+        """Add PID before file extension"""
+        if not filepath:
+            return filepath
+
+        path = Path(filepath)
+        pid = os.getpid()
+
+        if path.suffix:
+            # File has extension, insert PID before it
+            new_name = f"{path.stem}.{pid}{path.suffix}"
+        else:
+            # No extension, just append PID
+            new_name = f"{path.name}.{pid}"
+
+        return str(path.parent / new_name)
+
+    # Modify environment variables if they exist
+    if original_TTXLA_LOGGER_FILE:
+        os.environ["TTXLA_LOGGER_FILE"] = add_pid_to_filename(
+            original_TTXLA_LOGGER_FILE
+        )
+
+    if original_tt_logger_file:
+        os.environ["TT_LOGGER_FILE"] = add_pid_to_filename(original_tt_logger_file)
+
+    if original_ttmlir_runtime_logger_file:
+        os.environ["TTMLIR_RUNTIME_LOGGER_FILE"] = add_pid_to_filename(
+            original_ttmlir_runtime_logger_file
+        )
+
+    try:
+        yield
+    finally:
+        # Restore original values
+        if original_TTXLA_LOGGER_FILE:
+            os.environ["TTXLA_LOGGER_FILE"] = original_TTXLA_LOGGER_FILE
+
+        if original_tt_logger_file:
+            os.environ["TT_LOGGER_FILE"] = original_tt_logger_file
+
+        if original_ttmlir_runtime_logger_file:
+            os.environ["TTMLIR_RUNTIME_LOGGER_FILE"] = (
+                original_ttmlir_runtime_logger_file
+            )
+
+
+@pytest.fixture(autouse=True)
+def memory_usage_tracker(request):
+    """
+    A pytest fixture that tracks memory usage during the execution of a test.
+    Only runs if --log-memory is passed to pytest.
+    """
+    if request.config.getoption("--log-memory"):
+        process = psutil.Process()
+        # Initialize memory tracking variables
+        vm = psutil.virtual_memory()
+        start_mem = (vm.total - vm.available) / (1024 * 1024)  # MB
+        min_mem = start_mem
+        max_mem = start_mem
+        total_mem = start_mem
+        count = 1
+        tracking = True
+
+        def track_memory():
+            nonlocal min_mem, max_mem, total_mem, count
+            while tracking:
+                vm = psutil.virtual_memory()
+                used = (vm.total - vm.available) / (1024 * 1024)
+                min_mem = min(min_mem, used)
+                max_mem = max(max_mem, used)
+                total_mem += used
+                count += 1
+                time.sleep(0.1)
+
+        tracker_thread = threading.Thread(target=track_memory)
+        tracker_thread.start()
+        yield
+        tracking = False
+        tracker_thread.join()
+
+        vm = psutil.virtual_memory()
+        end_mem = (vm.total - vm.available) / (1024 * 1024)  # MB
+        min_mem = min(min_mem, end_mem)
+        max_mem = max(max_mem, end_mem)
+        total_mem += end_mem
+        count += 1
+        avg_mem = total_mem / count
+        by_test = max_mem - start_mem
+
+        proc_rss = process.memory_info().rss / (1024 * 1024)  # MB
+
+        with newline_logger():
+            logger.info(f"Test memory usage:")
+        logger.info(f"    By test: {by_test:.2f} MB")
+        logger.info(f"    Minimum: {min_mem:.2f} MB")
+        logger.info(f"    Maximum: {max_mem:.2f} MB")
+        logger.info(f"    Average: {avg_mem:.2f} MB")
+        logger.info(f"    RSS:     {proc_rss:.2f} MB")
+    else:
+        yield
+
+    # Clean up memory.
+    gc.collect()
+    libc = ctypes.CDLL("libc.so.6")
+    libc.malloc_trim(0)
+
+    if request.config.getoption("--log-memory"):
+        vm = psutil.virtual_memory()
+        after_gc = (vm.total - vm.available) / (1024 * 1024)  # MB
+        after_gc_rss = process.memory_info().rss / (1024 * 1024)  # MB
+        logger.info(
+            f"Memory usage after gc: {after_gc:.2f} MB (RSS: {after_gc_rss:.2f} MB)"
+        )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def initialize_device_connectors():
+    """
+    Autouse fixture that establishes connection to devices by creating connector
+    instances.
+
+    Done to make sure it is executed before any other jax command during tests.
+    """
+    DeviceConnectorFactory.create_connector(Framework.JAX)
+    DeviceConnectorFactory.create_connector(Framework.TORCH)
+
+
+CACHE_DIRECTORIES = [
+    Path.home() / ".cache" / "lfcache",
+    Path.home() / ".cache" / "url_cache",
+    Path("/mnt/dockercache/huggingface"),
+    Path.home() / ".cache" / "huggingface",
+    Path("/tmp") / "huggingface",
+    Path.home() / ".cache" / "jax",
+    Path.home() / ".cache" / "jaxlib",
+    Path("/tmp") / f"torchinductor_{os.environ.get('USER', '')}",
+]
+
+
+def cleanup_cache():
+    """
+    Cleans up cache directories if we are running on CIv2.
+    """
+    if _is_on_CIv2():
+        for cache_dir in CACHE_DIRECTORIES:
+            if not cache_dir.exists():
+                continue
+
+            try:
+                shutil.rmtree(cache_dir)
+                logger.debug(f"Cleaned up cache directory: {cache_dir}")
+            except Exception as e:
+                logger.warning(f"Failed to clean up cache directory {cache_dir}: {e}")
+
+
+@pytest.fixture(autouse=True)
+def cleanup_cache_fixture():
+    """
+    Pytest fixture that cleans up cache directories before and after each test.
+    Only runs if we are running on CIv2.
+    """
+    # Cleanup before test
+    cleanup_cache()
+
+    yield
+
+    # Cleanup after test
+    cleanup_cache()
+
+
+def _release_dynamo_bridge_tensors():
+    """Workaround for torch_xla leak: after torch._dynamo.reset(), GraphInputMatcher
+    objects and their parent caches survive, holding all model-weight XLA tensors
+    (~26 GB for 8B TP). We find these by type and clear their parent dicts.
+    """
+    from torch_xla._dynamo.dynamo_bridge import GraphInputMatcher
+
+    for obj in gc.get_objects():
+        try:
+            if isinstance(obj, torch.fx.GraphModule):
+                if getattr(obj, "xla_args", None) is not None:
+                    obj.xla_args = None
+
+            if isinstance(obj, GraphInputMatcher):
+                for ref in gc.get_referrers(obj):
+                    if isinstance(ref, tuple):
+                        for d in gc.get_referrers(ref):
+                            if isinstance(d, dict):
+                                d.clear()
+        except ReferenceError:
+            # Skip objects that have been garbage collected
+            continue
+
+
+# TODO(@LPanosTT): We do not need to reset the seed and dynamo state for jax test. Yet this will
+# do so blindly around all tests: https://github.com/tenstorrent/tt-xla/issues/1265.
+@pytest.fixture(autouse=True)
+def run_around_tests():
+    torch.manual_seed(0)
+    yield
+    torch._dynamo.reset()
+    _release_dynamo_bridge_tensors()
+
+
+@pytest.fixture(autouse=True)
+def chisel_context(request):
+    if not request.config.getoption("--enable-chisel"):
+        yield
+        return
+
+    try:
+        import chisel
+    except ImportError as e:
+        raise ImportError(
+            "Failed to import 'chisel'. Chisel requires the plugin to be built with "
+            "TT_RUNTIME_DEBUG and TTMLIR_ENABLE_BINDINGS_PYTHON enabled."
+        ) from e
+
+    safe_name = request.node.nodeid.replace("/", "_").replace("::", "__")
+    results_dir = Path("chisel_results")
+    results_dir.mkdir(parents=True, exist_ok=True)
+    with chisel.session(results_path=str(results_dir / f"{safe_name}.jsonl")):
+        yield
+
+
+@pytest.fixture()
+def clear_torchxla_computation_cache():
+    """
+    Pytest fixture that clears the TorchXLA computation cache before each test.
+    This helps avoid consteval-associated DRAM leaks as described in https://github.com/tenstorrent/tt-xla/issues/1940
+    """
+    yield
+    try:
+        xr.clear_computation_cache()
+    except Exception as e:
+        logger.warning(f"Failed to clear TorchXLA computation cache: {e}")
+        logger.warning(
+            "This is expected if the test throws an exception, https://github.com/tenstorrent/tt-xla/issues/2814"
+        )
+
+
+class TeeCaptureResult:
+    """Result object mimicking pytest's CaptureResult."""
+
+    def __init__(self, out: str, err: str):
+        self.out = out
+        self.err = err
+
+
+class _StreamTee:
+    """
+    Tee capture for a single stream (stdout or stderr).
+
+    Redirects a file descriptor to a memory-backed file (memfd). A background
+    thread reads from the memfd and forwards to both a capture buffer and the
+    original terminal.
+
+    Architecture::
+
+        Process -> stdout -> memfd -> Reader Thread -> Buffer + Terminal
+
+    Attributes:
+        _CHUNK_SIZE: Maximum bytes to read per iteration (class constant).
+        _original_fd: File descriptor of the stream being captured.
+        _saved_fd: Duplicated fd pointing to the original terminal for forwarding.
+        _memfd: Memory-backed file descriptor that receives redirected writes.
+        _read_fd: Separate fd for reading memfd with independent file position.
+        _buffer: StringIO buffer accumulating captured output.
+        _thread: Background thread running the reader loop.
+        _read_pos: Current byte position in the memfd for reading.
+        _final_size: Termination signal for reader thread. None means keep looping,
+            a numeric value N means exit after reading N bytes.
+    """
+
+    _CHUNK_SIZE = 65536
+
+    def __init__(self, stream):
+        self._original_fd = stream.fileno()
+        self._saved_fd = None
+        self._memfd = None
+        self._read_fd = None
+        self._buffer = io.StringIO()
+        self._thread = None
+        self._read_pos = 0
+        self._final_size = None
+
+    def start(self):
+        """Redirect stream to memfd and start reader thread."""
+        self._saved_fd = os.dup(self._original_fd)
+        self._memfd = os.memfd_create(f"tee_capture_{self._original_fd}")
+        self._read_fd = os.open(f"/proc/self/fd/{self._memfd}", os.O_RDONLY)
+        self._thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._thread.start()
+        os.dup2(self._memfd, self._original_fd)
+
+    def _reader_loop(self):
+        """Read from memfd, write to buffer and terminal."""
+        while True:
+            try:
+                file_size = os.fstat(self._memfd).st_size
+                if file_size > self._read_pos:
+                    data = os.pread(
+                        self._read_fd, file_size - self._read_pos, self._read_pos
+                    )
+                    if data:
+                        self._read_pos += len(data)
+                        self._buffer.write(data.decode("utf-8", errors="replace"))
+                        with contextlib.suppress(BlockingIOError, OSError):
+                            os.write(self._saved_fd, data)
+
+                if self._final_size is not None and self._read_pos >= self._final_size:
+                    return
+            except OSError:
+                return
+
+    def stop(self):
+        """Restore stream and wait for reader to finish."""
+        if self._saved_fd is not None:
+            with contextlib.suppress(OSError):
+                os.dup2(self._saved_fd, self._original_fd)
+
+        if self._memfd is not None:
+            self._final_size = os.fstat(self._memfd).st_size
+
+        if self._thread:
+            self._thread.join(timeout=5.0)
+
+        if self._memfd is not None and self._read_fd is not None:
+            try:
+                file_size = os.fstat(self._memfd).st_size
+                if file_size > self._read_pos:
+                    data = os.pread(
+                        self._read_fd, file_size - self._read_pos, self._read_pos
+                    )
+                    if data:
+                        self._buffer.write(data.decode("utf-8", errors="replace"))
+                        with contextlib.suppress(OSError):
+                            os.write(self._saved_fd, data)
+            except OSError:
+                pass
+
+        # Cleanup
+        for fd in (self._memfd, self._read_fd, self._saved_fd):
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+        self._memfd = self._read_fd = self._saved_fd = None
+
+    def getvalue(self):
+        """Return captured output."""
+        return self._buffer.getvalue()
+
+
+class TeeCapture:
+    """
+    Captures stderr/stdout at fd level while still writing to terminal in real-time.
+    This allows capturing C++ output (like MLIR errors) without suppressing it.
+
+    NOTE: This does NOT work with pytest-forked due to interpreter shutdown issues.
+    Use capfd instead when running with --forked.
+    """
+
+    def __init__(self):
+        self._stdout_tee = _StreamTee(sys.stdout)
+        self._stderr_tee = _StreamTee(sys.stderr)
+        self._started = False
+
+    def start(self):
+        try:
+            self._stdout_tee.start()
+            self._stderr_tee.start()
+            self._started = True
+        except OSError:
+            self._started = False
+
+    def stop(self):
+        if not self._started:
+            return
+        with contextlib.suppress(OSError):
+            sys.stdout.flush()
+        with contextlib.suppress(OSError):
+            sys.stderr.flush()
+        self._stdout_tee.stop()
+        self._stderr_tee.stop()
+
+    def readouterr(self):
+        return TeeCaptureResult(
+            self._stdout_tee.getvalue(), self._stderr_tee.getvalue()
+        )
+
+
+def _should_use_capfd(request) -> bool:
+    """
+    Determine if capfd should be used instead of TeeCapture.
+
+    Returns True when:
+    - Running with --forked (TeeCapture doesn't work with pytest-forked)
+    - Running in distributed mode (TeeCapture doesn't work in subprocesses)
+    - Pytest capture is enabled (TeeCapture conflicts with pytest's capture pipes)
+    """
+    # Check if --forked option was passed to pytest
+    try:
+        is_forked = request.config.getoption("--forked", default=False)
+    except ValueError:
+        is_forked = False
+
+    # Check if running in distributed/multi_host subprocess
+    is_distributed = os.environ.get("TT_RUNTIME_ENABLE_DISTRIBUTED") == "1"
+
+    # Check if pytest capture is enabled (not disabled via -s)
+    capture_mode = request.config.getoption("capture")
+    is_capturing = capture_mode != "no"
+
+    return is_forked or is_distributed or is_capturing
+
+
+@pytest.fixture()
+def captured_output_fixture(request):
+    """
+    Pytest fixture that captures stdout/stderr at fd level.
+
+    When running normally: Uses TeeCapture to show output in real-time while capturing.
+    When running with --forked: Uses pytest's capfd which handles forked processes correctly.
+    When running in distributed mode: Uses capfd (TeeCapture doesn't work in subprocesses).
+    """
+    if _should_use_capfd(request):
+        # Use capfd - handles forked/subprocess environments correctly
+        capfd = request.getfixturevalue("capfd")
+        yield capfd
+    else:
+        # Use TeeCapture for real-time output
+        tee = TeeCapture()
+        tee.start()
+        yield tee
+        tee.stop()

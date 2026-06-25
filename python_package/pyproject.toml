@@ -1,0 +1,11 @@
+[build-system]
+requires = [
+    "setuptools>=42",
+    "wheel",
+    "ninja",
+    "cmake",
+]
+build-backend = "setuptools.build_meta"
+
+[tool.cibuildwheel]
+repair-wheel-command = "auditwheel repair --exclude libTTMLIRRuntime.so --exclude libTTMLIRCompiler.so --exclude libtt-alchemist-lib.so --exclude libtt_metal.so --exclude libtt_stl.so --exclude libtt-umd.so.0 --exclude _ttnncpp.so --exclude _ttnn.so --exclude libdevice.so --exclude libtracy.so* -w {dest_dir} {wheel}"

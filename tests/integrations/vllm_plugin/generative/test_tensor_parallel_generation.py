@@ -1,0 +1,302 @@
+# SPDX-FileCopyrightText: (c) 2026 Tenstorrent AI ULC
+#
+# SPDX-License-Identifier: Apache-2.0
+import pytest
+import vllm
+from conftest import assert_output_coherent, check_host_memory
+
+
+@pytest.mark.push
+@pytest.mark.tensor_parallel
+@pytest.mark.dual_chip
+@pytest.mark.parametrize("model_name", ["meta-llama/Llama-3.2-3B"])
+def test_tensor_parallel_generation_n300(model_name: str):
+    prompts = [
+        "I like taking walks in the",
+    ]
+    sampling_params = vllm.SamplingParams(temperature=0.8, top_p=0.95, max_tokens=32)
+    llm_args = {
+        "model": model_name,
+        "max_num_batched_tokens": 32,
+        "max_num_seqs": 1,
+        "max_model_len": 32,
+        "gpu_memory_utilization": 0.002,
+        "additional_config": {
+            "enable_const_eval": True,
+            "min_context_len": 32,
+            "enable_tensor_parallel": True,
+        },
+    }
+    llm = vllm.LLM(**llm_args)
+
+    output_text = llm.generate(prompts, sampling_params)[0].outputs[0].text
+    print(f"prompt: {prompts[0]}, output: {output_text}")
+    assert_output_coherent(output_text)
+
+
+@pytest.mark.push
+@pytest.mark.tensor_parallel
+@pytest.mark.llmbox
+@pytest.mark.parametrize(
+    ["model_name", "use_2d_mesh", "opt_level"],
+    [
+        pytest.param("Qwen/Qwen3-0.6B", True, 0),
+        pytest.param("Qwen/Qwen3-0.6B", False, 1),
+    ],
+)
+def test_tensor_parallel_generation_llmbox_small(
+    model_name: str,
+    use_2d_mesh: bool,
+    opt_level: int,
+):
+    prompts = [
+        "Continue in English: I like taking walks in the",
+    ]
+    sampling_params = vllm.SamplingParams(temperature=0.8, top_p=0.95, max_tokens=32)
+    llm_args = {
+        "model": model_name,
+        "max_num_batched_tokens": 32,
+        "max_num_seqs": 1,
+        "max_model_len": 32,
+        "gpu_memory_utilization": 0.002,
+        "additional_config": {
+            "min_context_len": 32,
+            "enable_tensor_parallel": True,
+            "use_2d_mesh": use_2d_mesh,
+            "optimization_level": opt_level,
+        },
+    }
+    llm = vllm.LLM(**llm_args)
+
+    output_text = llm.generate(prompts, sampling_params)[0].outputs[0].text
+    print(f"prompt: {prompts[0]}, output: {output_text}")
+    assert_output_coherent(output_text)
+
+    check_host_memory(model_name)
+
+
+@pytest.mark.nightly
+@pytest.mark.tensor_parallel
+@pytest.mark.llmbox
+@pytest.mark.parametrize(
+    [
+        "model_name",
+        "experimental_weight_dtype",
+        "mesh_shape",
+        "opt_level",
+    ],
+    [
+        pytest.param("Qwen/Qwen3-32B", "", [2, 4], 0),
+        pytest.param("Qwen/Qwen3-8B", "", [1, 8], 1),
+        pytest.param("meta-llama/Llama-3.1-70B", "bfp_bf8", [2, 4], 0),
+    ],
+)
+def test_tensor_parallel_generation_llmbox_large(
+    model_name: str,
+    experimental_weight_dtype: str,
+    mesh_shape: list[int],
+    opt_level: int,
+):
+    prompts = [
+        "I like taking walks in the",
+    ]
+    sampling_params = vllm.SamplingParams(temperature=0.8, top_p=0.95, max_tokens=32)
+    llm_args = {
+        "model": model_name,
+        "max_num_batched_tokens": 32,
+        "max_num_seqs": 1,
+        "max_model_len": 32,
+        "gpu_memory_utilization": 0.002,
+        "additional_config": {
+            "min_context_len": 32,
+            "enable_tensor_parallel": True,
+            "experimental_weight_dtype": experimental_weight_dtype,
+            "mesh_shape": mesh_shape,
+            "optimization_level": opt_level,
+        },
+    }
+    llm = vllm.LLM(**llm_args)
+
+    output_text = llm.generate(prompts, sampling_params)[0].outputs[0].text
+    print(f"prompt: {prompts[0]}, output: {output_text}")
+    assert_output_coherent(output_text)
+
+    check_host_memory(model_name)
+
+
+@pytest.mark.nightly
+@pytest.mark.tensor_parallel
+@pytest.mark.galaxy_wh_6u
+@pytest.mark.parametrize(
+    ["model_name", "experimental_weight_dtype", "mesh_shape", "opt_level"],
+    [pytest.param("mistralai/Mistral-Large-Instruct-2411", "bfp_bf8", [4, 8], 0)],
+)
+def test_tensor_parallel_generation_galaxy_wh_6u_large(
+    model_name: str,
+    experimental_weight_dtype: str,
+    mesh_shape: list[int],
+    opt_level: int,
+):
+    inputs = ["How many days ago was Mistral founded?"]
+
+    sampling_params = vllm.SamplingParams(temperature=0.8, top_p=0.95, max_tokens=16)
+    llm_args = {
+        "model": model_name,
+        "max_num_batched_tokens": 32,
+        "max_num_seqs": 1,
+        "max_model_len": 32,
+        "gpu_memory_utilization": 0.02,
+        "additional_config": {
+            "min_context_len": 64,
+            "enable_tensor_parallel": True,
+            "experimental_weight_dtype": experimental_weight_dtype,
+            "mesh_shape": mesh_shape,
+            "optimization_level": opt_level,
+        },
+    }
+    llm = vllm.LLM(**llm_args)
+
+    output_text = llm.generate(inputs, sampling_params)[0].outputs[0].text
+    print("output: ", output_text)
+    assert_output_coherent(output_text)
+
+    check_host_memory(model_name)
+
+
+@pytest.mark.nightly
+@pytest.mark.tensor_parallel
+@pytest.mark.parametrize(
+    ["mesh_shape", "opt_level"],
+    [
+        pytest.param([1, 4], 0, marks=pytest.mark.bhqb),
+        pytest.param([8, 4], 0, marks=pytest.mark.bh_galaxy),
+    ],
+)
+def test_tensor_parallel_generation_gemma4_31b(
+    mesh_shape: list[int],
+    opt_level: int,
+):
+
+    model_name = "google/gemma-4-31B-it"
+
+    messages = [[{"role": "user", "content": "Describe Tenstorrent in one sentence."}]]
+    sampling_params = vllm.SamplingParams(temperature=0.0, top_p=1.0, max_tokens=32)
+    llm_args = {
+        "model": model_name,
+        # Text-only path on a multimodal model: zero every modality so the
+        # mm-encoder graph doesn't compile the vision tower at all.
+        "limit_mm_per_prompt": {"image": 0, "video": 0, "audio": 0},
+        # Gemma-4 mm enforces a floor from MultiModalBudget regardless of
+        # limit_mm_per_prompt; 2560 clears the video-frame floor of 2496.
+        "max_num_batched_tokens": 2560,
+        "max_num_seqs": 1,
+        "max_model_len": 128,
+        "gpu_memory_utilization": 0.1,
+        "additional_config": {
+            "min_context_len": 32,
+            "enable_tensor_parallel": True,
+            "mesh_shape": mesh_shape,
+            "flat_model_io": True,
+            "optimization_level": opt_level,
+        },
+    }
+    llm = vllm.LLM(**llm_args)
+
+    output_text = llm.chat(messages, sampling_params)[0].outputs[0].text
+    print(f"output: {output_text}")
+    assert_output_coherent(output_text)
+
+    check_host_memory(model_name)
+
+
+@pytest.mark.nightly
+@pytest.mark.tensor_parallel
+@pytest.mark.llmbox
+@pytest.mark.parametrize(
+    ["model_name", "opt_level"],
+    [
+        pytest.param("mistralai/Mistral-Small-3.1-24B-Instruct-2503", 0),
+        pytest.param("mistralai/Mistral-Small-3.2-24B-Instruct-2506", 0),
+    ],
+)
+def test_tensor_parallel_generation_mistral_small(model_name: str, opt_level: int):
+    image_url = "https://static.wikia.nocookie.net/essentialsdocs/images/7/70/Battle.png/revision/latest?cb=20220523172438"
+
+    user_text = "What action do you think I should take in this situation? "
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": user_text},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ],
+        },
+    ]
+    sampling_params = vllm.SamplingParams(temperature=0.8, top_p=0.95, max_tokens=32)
+
+    llm_args = {
+        "model": model_name,
+        "limit_mm_per_prompt": {"image": 1},
+        "max_num_batched_tokens": 3025,
+        "max_num_seqs": 1,
+        "max_model_len": 512,
+        "gpu_memory_utilization": 0.01,
+        "additional_config": {
+            "min_context_len": 32,
+            "enable_tensor_parallel": True,
+            "experimental_weight_dtype": "bfp_bf8",
+            "optimization_level": opt_level,
+        },
+    }
+    llm = vllm.LLM(**llm_args)
+
+    output_text = llm.chat(messages, sampling_params=sampling_params)[0].outputs[0].text
+    print(f"prompt: {user_text}, output: {output_text}")
+    assert_output_coherent(output_text)
+
+    check_host_memory(model_name)
+
+
+@pytest.mark.nightly
+@pytest.mark.tensor_parallel
+@pytest.mark.galaxy_wh_6u
+@pytest.mark.parametrize(
+    ["model_name", "opt_level"],
+    [pytest.param("mistralai/Pixtral-Large-Instruct-2411", 0)],
+)
+def test_tensor_parallel_generation_galaxy_wh_6u_large(model_name: str, opt_level: int):
+    image_url = "https://static.wikia.nocookie.net/essentialsdocs/images/7/70/Battle.png/revision/latest?cb=20220523172438"
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "What action do you think I should take in this situation?",
+                },
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ],
+        },
+    ]
+
+    sampling_params = vllm.SamplingParams(temperature=0.8, top_p=0.95, max_tokens=32)
+    llm_args = {
+        "model": model_name,
+        "max_num_batched_tokens": 4906,
+        "max_num_seqs": 1,
+        "max_model_len": 1024,
+        "gpu_memory_utilization": 0.17,
+        "additional_config": {
+            "min_context_len": 1024,
+            "enable_tensor_parallel": True,
+            "experimental_weight_dtype": "bfp_bf8",
+            "optimization_level": opt_level,
+        },
+    }
+    llm = vllm.LLM(**llm_args)
+
+    output_text = llm.chat(messages, sampling_params=sampling_params)[0].outputs[0].text
+    print("output: ", output_text)
+    assert_output_coherent(output_text)
+
+    check_host_memory(model_name)

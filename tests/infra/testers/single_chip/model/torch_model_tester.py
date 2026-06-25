@@ -1,0 +1,462 @@
+# SPDX-FileCopyrightText: (c) 2025 Tenstorrent AI ULC
+#
+# SPDX-License-Identifier: Apache-2.0
+
+import collections
+import os
+import shutil
+import tempfile
+from contextlib import contextmanager
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Set, Tuple
+
+import torch
+import torch_xla
+import torch_xla.runtime as xr
+from infra.evaluators import ComparisonConfig
+from infra.evaluators.torch_comparison_evaluator import TorchComparisonEvaluator
+from infra.utilities import Framework, compile_torch_workload_for_tt_device
+from infra.workloads import TorchWorkload, Workload
+from tt_torch.sharding import sharding_constraint_tensor
+from ttxla_tools.logging import logger
+
+from tests.infra.evaluators import ComparisonResult
+from tests.infra.testers.compiler_config import CompilerConfig
+from third_party.tt_forge_models.config import Parallelism
+
+from .model_tester import ModelTester, RunMode
+
+
+@contextmanager
+def _mask_jax_accelerator():
+    """Temporarily hide jax accelerator to avoid inductor issues with no-tensor-input graphs.
+
+    When torchax is imported (via torch_xla's mark_sharding), it registers 'jax' as a PyTorch
+    accelerator. This causes inductor to fail when compiling graphs with no tensor inputs,
+    as it tries to call torch.accelerator.current_device_index() which isn't supported for jax.
+    """
+    original_fn = torch.accelerator.is_available
+
+    def masked_is_available():
+        try:
+            acc = torch.accelerator.current_accelerator()
+            # current_accelerator() returns device(type='jax'), need to check .type
+            if acc and acc.type == "jax":
+                return False
+        except RuntimeError:
+            pass
+        return original_fn()
+
+    torch.accelerator.is_available = masked_is_available
+    try:
+        yield
+    finally:
+        torch.accelerator.is_available = original_fn
+
+
+class TorchModelTester(ModelTester):
+    """
+    Abstract base class all single chip `torch` model testers must inherit.
+
+    Derived classes must provide implementations of:
+    ```
+    _get_model(self) -> Model
+    _get_input_activations(self) -> Sequence[Any]
+    _get_forward_method_args(self) -> Sequence[Any] # Optional, has default behaviour.
+    _get_forward_method_kwargs(self) -> Mapping[str, Any] # Optional, has default behaviour.
+    ```
+
+    Attributes:
+        _model_size: Stores the model size in number of parameters
+    """
+
+    def __init__(
+        self,
+        comparison_config: ComparisonConfig = ComparisonConfig(),
+        run_mode: RunMode = RunMode.INFERENCE,
+        compiler_config: CompilerConfig = None,
+        parallelism=None,
+        dtype_override=None,
+        custom_comparator: Optional[Callable] = None,
+    ) -> None:
+
+        self._input_activations: Dict | Sequence[Any] = None
+        self._parallelism = parallelism
+        self._model_size = None
+
+        super().__init__(
+            comparison_config,
+            run_mode,
+            Framework.TORCH,
+            compiler_config,
+            dtype_override,
+            custom_comparator=custom_comparator,
+        )
+        # Set custom compile options if provided.
+        # Use explicit API for passing compiler options.
+        if compiler_config is not None:
+            torch_xla.set_custom_compile_options(
+                compiler_config.to_torch_compile_options()
+            )
+
+    # @override
+    def _configure_model(self) -> None:
+        self._device_runner.set_training_mode(self._run_mode == RunMode.TRAINING)
+        super()._configure_model()
+        self._calculate_model_size()
+
+    # @override
+    def _configure_model_for_inference(self) -> None:
+        assert isinstance(self._model, torch.nn.Module)
+        self._model.eval()
+
+    # @override
+    def _configure_model_for_training(self) -> None:
+        assert isinstance(self._model, torch.nn.Module)
+        self._model.train()
+
+    def _calculate_model_size(self) -> None:
+        """Calculate and store the total number of parameters in the model."""
+        if isinstance(self._model, torch.nn.Module):
+            self._model_size = sum(p.numel() for p in self._model.parameters())
+            logger.debug(f"Model size: {self._model_size / 1e9}B")
+        else:
+            logger.debug("Model is not a torch.nn.Module, skipping size calculation")
+            self._model_size = None
+
+    # @override
+    def _cache_model_inputs(self) -> None:
+        """Caches model inputs."""
+        self._input_activations = self._get_input_activations()
+
+    # @override
+    def _initialize_workload(self) -> None:
+        """Initializes `self._workload`."""
+        # Prepack model's forward pass and its arguments into a `Workload.`
+        args = self._get_forward_method_args()
+        kwargs = self._get_forward_method_kwargs()
+
+        assert (
+            len(args) > 0 or len(kwargs) > 0
+        ), f"Forward method args or kwargs or both must be provided"
+
+        self._workload = TorchWorkload(
+            model=self._model,
+            args=args,
+            kwargs=kwargs,
+            mesh=self._get_mesh(),
+            shard_spec_fn=self._get_shard_specs_function(),
+        )
+
+        if self._parallelism == Parallelism.TENSOR_PARALLEL:
+            assert (
+                self._workload.shard_spec_fn is not None
+            ), "Tensor parallel requires shard specs function"
+            assert (
+                self._workload.mesh and len(self._workload.mesh.device_ids) > 1
+            ), "Tensor parallel requires multi-chip mesh"
+
+    # @override
+    def _get_forward_method_args(self) -> Sequence[Any]:
+        if isinstance(self._input_activations, torch.Tensor):
+            return [self._input_activations]
+        if isinstance(self._input_activations, (tuple, list)):
+            return list(self._input_activations)
+        return []
+
+    # @override
+    def _get_forward_method_kwargs(self) -> Mapping[str, Any]:
+        if isinstance(self._input_activations, collections.abc.Mapping):
+            return {**self._input_activations}
+        return {}
+
+    def _run_on_cpu(self, compiled_workload: Workload) -> torch.Tensor:
+        """Runs workload on CPU with jax accelerator masked.
+
+        Uses _mask_jax_accelerator because torch.compile with inductor is lazy -
+        actual compilation happens during execution, not during torch.compile() call.
+        """
+        with _mask_jax_accelerator():
+            return super()._run_on_cpu(compiled_workload)
+
+    def _compile_for_tt_device(self, workload: Workload, options=None) -> None:
+        """Compile Torch workload for TT device."""
+        compile_torch_workload_for_tt_device(workload=workload, torch_options=options)
+
+    def _unpack_forward_output(self, output: Any) -> torch.Tensor:
+        """
+        Unwraps model output to a single tensor.
+        In base case, we assume the output is a single tensor.
+        """
+        return output
+
+    def _extract_grads(
+        self, model: torch.nn.Module
+    ) -> Tuple[Dict[str, torch.Tensor], Set[str]]:
+        """
+        Extracts gradients from a model and returns a dictionary of gradients and a dictionary of None gradients.
+        """
+        # TODO: Right now, we only extract gradients for parameters that have a gradient.
+        # In the future, we should extract gradients for all parameters that require grad is True.
+        #
+        existing_grads = {
+            name: p.grad.clone()
+            for name, p in model.named_parameters()
+            if p.requires_grad and p.grad is not None
+        }
+        none_grads = set(
+            name
+            for name, p in model.named_parameters()
+            if p.requires_grad and p.grad is None
+        )
+        return existing_grads, none_grads
+
+    def mark_gradient_sharding(self, model: torch.nn.Module):
+        """Apply sharding to gradients based on parameter shard specs.
+
+        For tensor parallel training, gradients must be sharded identically to parameters.
+        This method marks gradient tensors with the same shard specs as their parameters.
+        """
+
+        assert (
+            self._workload.shard_spec_fn is not None
+        ), "Shard spec function must be provided for tensor parallel training"
+        assert (
+            self._workload.mesh is not None
+        ), "Mesh must be provided for tensor parallel training"
+
+        # Get shard specs from the model
+        shard_specs = self._workload.shard_spec_fn(self._model)
+        assert (
+            shard_specs is not None
+        ), "Shard specs must be provided for tensor parallel training"
+
+        for name, param in model.named_parameters():
+            if param.grad is None:
+                continue
+            if param not in shard_specs:
+                logger.warning(f"Parameter {name} not found in shard specs")
+                continue
+            shard_spec = shard_specs[param]
+            param.grad = sharding_constraint_tensor(
+                param.grad, self._workload.mesh, shard_spec
+            )
+
+    def _test_training(self) -> Tuple[ComparisonResult, ...]:
+        # Initialize XLA computation client to properly set up autograd engine device queues
+        # before any backward passes. See: https://github.com/pytorch/xla/issues/4174
+        torch_xla._XLAC._init_computation_client()
+
+        # Run forward on CPU
+        cpu_res = self._run_on_cpu(self._workload)
+        cpu_res = self._unpack_forward_output(cpu_res)
+
+        # Generate random gradient
+        random_grad = torch.randn(cpu_res.shape, dtype=cpu_res.dtype)
+
+        # Create and run backward on CPU
+        cpu_backward_workload = Workload(
+            framework=self._framework,
+            executable=cpu_res.backward,
+            args=[],
+            kwargs={"gradient": random_grad},
+        )
+        self._run_on_cpu(cpu_backward_workload)
+
+        cpu_grads, cpu_none_grads = self._extract_grads(self._model)
+        self._workload.model.zero_grad()
+
+        # Run forward on TT
+        compile_options = {
+            "tt_legacy_compile": True,
+            # Workaround for issue: https://github.com/tenstorrent/tt-xla/issues/3289
+            "tt_enable_torch_fx_fusion_pass": False,
+        }
+
+        self._compile_for_tt_device(self._workload, compile_options)
+        tt_res = self._run_on_tt_device(self._workload)
+        tt_res = self._unpack_forward_output(tt_res)
+
+        # Force graph break so we can differentiate between forward and backward
+        torch_xla.sync(wait=True)
+
+        # Run backward on TT
+        tt_backward_workload = Workload(
+            framework=self._framework,
+            executable=tt_res.backward,
+            args=[],
+            kwargs={"gradient": random_grad},
+        )
+        self._run_on_tt_device(tt_backward_workload)
+
+        if self._parallelism == Parallelism.TENSOR_PARALLEL:
+            self.mark_gradient_sharding(self._model)
+
+        # TODO: Adding explicit sync to ensure view of gradients are not computed without reason
+        # https://github.com/tenstorrent/tt-xla/issues/1466
+        wanted_grads = [p.grad for p in self._model.parameters() if p.grad is not None]
+        torch_xla._XLAC._xla_sync_multi(
+            wanted_grads,
+            list(set([p.device.type for p in wanted_grads])),
+            wait=True,
+        )
+        tt_grads, tt_none_grads = self._extract_grads(self._model)
+
+        assert (
+            len(tt_grads.keys()) > 0
+        ), "No TT gradients collected - check that the model has trainable parameters"
+        assert (
+            len(cpu_grads.keys()) > 0
+        ), "No CPU gradients collected - check that the model has trainable parameters"
+        assert (
+            cpu_none_grads == tt_none_grads
+        ), f"CPU and TT have different None grad parameters: {cpu_none_grads} != {tt_none_grads}"
+        logger.warning(f"Grads: {cpu_none_grads} are None")
+
+        forward_result = self._compare(tt_res, cpu_res)
+
+        # Stream gradient comparison one parameter at a time. Comparing the full
+        # grad pytree in one call doubles memory (fp32→fp64 cast in
+        # _match_data_types) and creates large intermediates, peaking at 20+GB
+        # host RSS for 0.5-0.6B param models and OOM-killing on CI runners.
+        backward_result = ComparisonResult(
+            passed=True,
+            error_message=None,
+            pcc=None,
+            atol=None,
+            allclose=True,
+            equal=True,
+        )
+        backward_error_messages = []
+        for name in list(tt_grads.keys()):
+            tt_v = tt_grads.pop(name)
+            cpu_v = cpu_grads.pop(name)
+            r = self._compare(tt_v, cpu_v)
+            if r.atol is not None:
+                backward_result.atol = (
+                    r.atol
+                    if backward_result.atol is None
+                    else max(backward_result.atol, r.atol)
+                )
+            if r.pcc is not None:
+                backward_result.pcc = (
+                    r.pcc
+                    if backward_result.pcc is None
+                    else min(backward_result.pcc, r.pcc)
+                )
+            if r.allclose is False:
+                backward_result.allclose = False
+            if r.equal is False:
+                backward_result.equal = False
+            if not r.passed:
+                backward_result.passed = False
+                if r.error_message:
+                    backward_error_messages.append(f"[{name}] {r.error_message}")
+            del tt_v, cpu_v, r
+        if backward_error_messages:
+            backward_result.error_message = "\n".join(backward_error_messages)
+
+        # Only the first result is recorded in the report properties,
+        # and only want to report on the backward result
+        return backward_result, forward_result
+
+    def verify_emitpy(
+        self,
+        fb_reference,
+        assert_exact: bool = True,
+    ) -> None:
+        """Verify EmitPy (codegen_py) execution matches flatbuffer execution.
+
+        Resets dynamo and XLA caches to force a fresh recompilation with EmitPy
+        options, then compares the EmitPy result against the flatbuffer reference
+        from the original test run.
+
+        When assert_exact is True (default), asserts that results match exactly.
+        On failure the assertion message includes atol, pcc, and allclose diagnostics.
+
+        Args:
+            fb_reference: Flatbuffer reference result from the original test execution.
+            assert_exact: If True, raise AssertionError when results differ.
+        """
+        original_options = (
+            self._compiler_config.to_torch_compile_options()
+            if self._compiler_config
+            else {}
+        )
+
+        emitpy_export_path = tempfile.mkdtemp(prefix="emitpy_test_")
+        try:
+            # Nuke all dynamo and XLA caches so the next torch.compile call
+            # produces a fresh executable rather than reusing the already-compiled
+            # (non-EmitPy) one.
+            torch._dynamo.reset()
+            xr.clear_computation_cache()
+
+            # --- EmitPy run (legacy-compiled workload, emitpy PJRT options) ---
+            emitpy_options = {
+                **original_options,
+                "backend": "codegen_py",
+                "export_path": emitpy_export_path,
+                "export_tensors": "true",
+                "dry_run": "false",
+            }
+            torch_xla.set_custom_compile_options(emitpy_options)
+
+            self._compile_for_tt_device(
+                self._workload, options={"tt_legacy_compile": True}
+            )
+
+            emitpy_result = self._run_on_tt_device(self._workload)
+
+            # Compare EmitPy vs flatbuffer using the standard evaluator.
+            emitpy_config = ComparisonConfig(assert_on_failure=False)
+            emitpy_config.enable_all()
+            evaluator = TorchComparisonEvaluator(emitpy_config)
+            result = evaluator.evaluate(emitpy_result, fb_reference)
+
+            if not result.equal and assert_exact:
+                raise AssertionError(
+                    f"EmitPy result differs from flatbuffer. "
+                    f"atol={result.atol}, pcc={result.pcc}, "
+                    f"allclose={result.allclose}"
+                )
+        finally:
+            # Restore original compile options and clear caches to avoid
+            # state leaking into subsequent tests.
+            torch_xla.set_custom_compile_options(original_options)
+            torch._dynamo.reset()
+            xr.clear_computation_cache()
+
+            shutil.rmtree(emitpy_export_path, ignore_errors=True)
+
+    # @override
+    def _apply_model_dtype(self) -> None:
+        """Applies dtype_override to the model."""
+        if hasattr(self._model, "to"):
+            self._model = self._model.to(self._dtype_override)
+        else:
+            raise TypeError("Model does not have 'to' method to apply dtype.")
+
+    # @override
+    def _apply_inputs_dtype(self) -> None:
+        """Applies dtype_override to inputs, only casting float tensors."""
+        self._input_activations = self._cast_tensors_to_dtype(
+            self._input_activations, self._dtype_override
+        )
+
+    def _cast_tensors_to_dtype(self, obj, dtype):
+        """Recursively cast float tensors in a nested structure to the given dtype."""
+        if isinstance(obj, torch.Tensor):
+            # Only cast floating point tensors, leave integer tensors unchanged
+            if obj.dtype.is_floating_point:
+                return obj.to(dtype)
+            return obj
+        elif isinstance(obj, (list, tuple)):
+            cast_items = [self._cast_tensors_to_dtype(item, dtype) for item in obj]
+            return type(obj)(cast_items)
+        elif isinstance(obj, dict):
+            return {
+                key: self._cast_tensors_to_dtype(value, dtype)
+                for key, value in obj.items()
+            }
+        else:
+            return obj

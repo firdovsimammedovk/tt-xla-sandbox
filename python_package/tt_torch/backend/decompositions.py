@@ -1,0 +1,489 @@
+# SPDX-FileCopyrightText: (c) 2025 Tenstorrent AI ULC
+#
+# SPDX-License-Identifier: Apache-2.0
+import contextlib
+import threading
+from typing import Callable, Dict, List, Optional, Sequence, Union
+
+import torch
+from torch._decomp import get_decompositions, remove_decompositions
+
+DecompositionTable = Dict[torch._ops.OperatorBase, Callable]
+DecompositionOpsList = Sequence[
+    Union[torch._ops.OperatorBase, torch._ops.OpOverloadPacket]
+]
+
+
+# This method is derived from the implementation of jax.image.resize in JAX:
+#     https://github.com/jax-ml/jax/blob/354bd5271077654af983965c8e01ee462ce4ce91/jax/_src/image/scale.py#L52
+#
+# I've modified it to use torch rather than JAX. I've also added the ability
+# to generate a weight matrix that allows the matmul to be identical to
+# torch's upsample_bilinear2d when align_corners=True.
+# This logic was derived from @brentyi's implementation in:
+#    https://github.com/jax-ml/jax/issues/11206#issuecomment-1423140760
+def compute_linear_weight(input_size, output_size, scale, align_corners, dtype, device):
+    if input_size == 1:
+        return torch.ones(1, output_size, dtype=dtype, device=device)
+    translation = 0
+    if align_corners:
+        scale = (output_size - 1) / (input_size - 1)
+        translation = 0.5 - (scale / 2)
+
+    inv_scale = 1 / scale
+    sample_f = (
+        (torch.arange(output_size, dtype=torch.float64, device=device) + 0.5)
+        * inv_scale
+        - translation * inv_scale
+        - 0.5
+    )
+    x = torch.abs(
+        sample_f
+        - torch.arange(input_size, dtype=torch.float64, device=device).unsqueeze(1)
+    )
+
+    weights = torch.relu(1 - torch.abs(x))
+
+    total_weight_sum = torch.sum(weights, axis=0, keepdims=True)
+    total_weight_sum = torch.where(total_weight_sum != 0, total_weight_sum, 1)
+    weights = torch.divide(
+        weights,
+        total_weight_sum,
+    )
+
+    weights = torch.where(
+        torch.logical_and(sample_f >= -0.5, sample_f <= input_size - 0.5),
+        weights,
+        0,
+    )
+
+    return weights.to(dtype)
+
+
+def compute_nearest_weight(in_size, out_size, scale, dtype, device):
+    scale = 1 / scale if scale is not None else in_size / out_size
+    out_idx = torch.arange(out_size, dtype=torch.float64, device=device)
+    input_indices = torch.floor(out_idx * scale).to(torch.long)
+    weight = (
+        torch.nn.functional.one_hot(input_indices, num_classes=in_size)
+        .transpose(0, 1)
+        .to(dtype=dtype)
+    )
+    return weight
+
+
+def upsample_linear(
+    input: torch.Tensor,
+    output_size: List[int],
+    align_corners: bool,
+    scales: List[Optional[float]],
+) -> torch.Tensor:
+    input_size = input.shape[-len(scales) :]
+
+    for i in range(len(scales)):
+        scales[i] = float(output_size[i]) / float(input_size[i])
+
+    res = input
+    for i in range(len(scales)):
+        weight = compute_linear_weight(
+            input_size[i],
+            output_size[i],
+            scales[i],
+            align_corners,
+            input.dtype,
+            input.device,
+        )
+        res = (res.transpose(i - len(scales), -1) @ weight).transpose(
+            i - len(scales), -1
+        )
+
+    return res
+
+
+def upsample_nearest(
+    input: torch.Tensor,
+    output_size: List[int],
+    scales: List[Optional[float]],
+    exact: bool = False,
+):
+    input_size = input.shape[-len(scales) :]
+
+    res = input
+    for i in range(len(scales)):
+        weight = compute_nearest_weight(
+            input_size[i], output_size[i], scales[i], input.dtype, input.device
+        )
+        res = (res.transpose(i - len(scales), -1) @ weight).transpose(
+            i - len(scales), -1
+        )
+
+    return res
+
+
+def upsample_linear_vec(
+    input: torch.Tensor,
+    output_size: Optional[List[int]],
+    align_corners: bool,
+    scale_factors: Optional[List[float]],
+) -> torch.Tensor:
+    scale_factors = scale_factors if output_size is None else None
+    osize = torch._decomp.decompositions.upsample_compute_output_size(
+        input.size(), output_size, scale_factors
+    )
+    scales = scale_factors if scale_factors else [None] * len(osize)
+    return upsample_linear(input, osize, align_corners, scales)
+
+
+def upsample_linear_default(
+    input: torch.Tensor,
+    output_size: list[int],
+    align_corners: bool,
+    scales_h: Optional[float] = None,
+    scales_w: Optional[float] = None,
+    scales_d: Optional[float] = None,
+) -> torch.Tensor:
+    scale_factors = [scales_h, scales_w, scales_d] if output_size is None else None
+    osize = torch._decomp.decompositions.upsample_compute_output_size(
+        input.size(), output_size, scale_factors
+    )
+    scales = scale_factors if scale_factors else [None] * len(osize)
+    return upsample_linear(input, osize, align_corners, scales)
+
+
+def upsample_nearest_vec(
+    input: torch.Tensor,
+    output_size: Optional[List[int]],
+    scale_factors: Optional[List[float]],
+) -> torch.Tensor:
+    scale_factors = scale_factors if output_size is None else None
+    osize = torch._decomp.decompositions.upsample_compute_output_size(
+        input.size(), output_size, scale_factors
+    )
+    scales = (
+        scale_factors if scale_factors else [None] * len(osize)  # type: ignore[list-item]
+    )
+    return upsample_nearest(input, osize, scales)
+
+
+def upsample_nearest_default(
+    input: torch.Tensor,
+    output_size: list[int],
+    scales_h: Optional[float] = None,
+    scales_w: Optional[float] = None,
+    scales_d: Optional[float] = None,
+) -> torch.Tensor:
+    scale_factors = [scales_h, scales_w, scales_d] if output_size is None else None
+    osize = torch._decomp.decompositions.upsample_compute_output_size(
+        input.size(), output_size, scale_factors
+    )
+    scales = (
+        scale_factors if scale_factors else [None] * len(osize)  # type: ignore[list-item]
+    )
+    return upsample_nearest(input, osize, scales)
+
+
+# TODO: Remove this decomposition when we can lower a stablehlo.reduce_window which is equivalent to a sum-pool
+# to ttir
+def avg_pool2d(
+    input: torch.Tensor,
+    kernel_size: Union[int, List[int]],
+    stride: Optional[Union[int, List[int]]] = None,
+    padding: Union[int, List[int]] = 0,
+    ceil_mode: bool = False,
+    count_include_pad: bool = True,
+    divisor_override: Optional[int] = None,
+) -> torch.Tensor:
+
+    if isinstance(kernel_size, int):
+        kernel_size = [kernel_size, kernel_size]
+    if stride is None:
+        stride = kernel_size
+    if isinstance(stride, int):
+        stride = [stride, stride]
+    if isinstance(padding, int):
+        padding = [padding, padding, padding, padding]
+
+    input_size = list(input.shape[-len(stride) :])
+    if stride == kernel_size == input_size and padding == [0, 0, 0, 0]:
+        return input.mean(dim=[-2, -1], keepdim=True)
+
+    # If we call the regular torch.nn.functional.avg_pool2d, it will infinitely recurse into this function.
+    # Returning NotImplemented allows the tracer to use the default implementation.
+    return NotImplemented
+
+
+# TODO: Test if this is still necessary when compiling via torch-xla
+def split_with_sizes(
+    self: torch.Tensor, split_sizes: List[int], dim: int = 0
+) -> List[torch.Tensor]:
+    # NB: Perform the check_is_size tests first so that the
+    # sum test does not try to do a replacement
+    for i in range(len(split_sizes)):
+        torch._check_is_size(
+            split_sizes[i],
+            lambda: "split_with_sizes expects split_sizes have only non-negative entries",
+        )
+    torch._check_with(
+        ValueError,
+        sum(split_sizes) == self.shape[dim],
+        lambda: f"Split sizes add up to {sum(split_sizes)} but got the tensor's size of {self.shape[dim]}",
+    )
+    num_splits = len(split_sizes)
+    splits = []
+    start_idx = 0
+
+    for i in range(num_splits):
+        length = split_sizes[i]
+        splits.append(self.narrow(dim, start_idx, length))
+        start_idx += length
+    return splits
+
+
+# TODO: Test if this is still necessary when compiling via torch-xla
+def masked_fill_tensor(input, mask, value):
+    if value.device != input.device:
+        value = value.to(input.device)
+        return torch.masked_fill(input, mask, value)
+    return NotImplemented
+
+
+# Squeeze is defined as an aten::prim op in some circumstances. This
+# causes issues during the passes we run on the GraphModule in `torch_pass_pipeline`.
+# This decomposition converts the squeeze to a reshape.
+def squeeze(input, dims):
+    shape = input.shape
+    newshape = [s for i, s in enumerate(shape) if i not in dims]
+    return input.reshape(newshape)
+
+
+def matmul(
+    input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None
+):
+
+    if len(input.shape) >= 4 or len(weight.shape) >= 4:
+        res = torch.einsum("...mk,...kn->...mn", input, weight)
+        if bias is not None:
+            res = res + bias
+        return res
+    else:
+        return NotImplemented
+
+
+def dot(input: torch.Tensor, tensor: torch.Tensor):
+    # Decompose dot product into matmul for 1D tensors.
+    if len(input.shape) == 1 and len(tensor.shape) == 1:
+        return torch.matmul(input, tensor)
+    else:
+        return NotImplemented
+
+
+def boolean_bitwise_and(input: torch.Tensor, other: torch.Tensor) -> torch.Tensor:
+    if input.dtype == torch.bool and other.dtype == torch.bool:
+        return torch.logical_and(input, other)
+    return NotImplemented
+
+
+def boolean_bitwise_or(input: torch.Tensor, other: torch.Tensor) -> torch.Tensor:
+    if input.dtype == torch.bool and other.dtype == torch.bool:
+        return torch.logical_or(input, other)
+    return NotImplemented
+
+
+def sum_dim_IntList(
+    input: torch.Tensor,
+    dim: Optional[List[int]] = None,
+    keepdim: bool = False,
+    dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    if dim is not None and len(dim) == 0:
+        return torch.sum(
+            input, dim=list(range(input.ndim)), keepdim=keepdim, dtype=dtype
+        )
+    return NotImplemented
+
+
+def copy_default(
+    dst: torch.Tensor, src: torch.Tensor, non_blocking: bool = False
+) -> torch.Tensor:
+    """
+    Decomposition for aten.copy.default that correctly handles the broadcast semantics.
+
+    The copy operation copies values from src into dst and returns a tensor with dst's shape.
+    When src is a scalar (0-d tensor) and dst has a larger shape, src should be broadcast.
+
+    This decomposition is needed because functional tensors + XLA can have incorrect behavior
+    with the native copy.default, returning the source shape instead of the destination shape.
+
+    The decomposition uses _to_copy for device/dtype conversion (traces correctly) and
+    expand for broadcasting.
+    """
+    # Use _to_copy for device and dtype conversion - this traces correctly during decomposition
+    # Unlike .to(), _to_copy is a proper aten op that will be in the graph
+
+    src_converted = torch.ops.aten._to_copy.default(
+        src, dtype=dst.dtype, device=dst.device
+    )
+    # Expand to dst's shape (handles scalar -> tensor broadcast)
+    # Then clone to ensure contiguous memory
+    return src_converted.expand(dst.shape).clone()
+
+
+def masked_scatter(
+    data: torch.Tensor, mask: torch.Tensor, source: torch.Tensor
+) -> torch.Tensor:
+    """
+    Custom decomposition for masked_scatter
+    Decomposes masked_scatter into basic operations: broadcast, reshape, cumsum, clamp, gather, where
+
+    Row-wise fast path: O(B*S) cumsum instead of O(B*S*H).
+    The flat cumsum on B*S*H elements OOMs on TT hardware (TTNN allocates one 32x32
+    tile per output element, so 277*2560=709k elements → 2.9 GB for the cumsum alone).
+
+    The fast path is valid when the mask is row-constant (same True/False for every
+    element in a row).
+    """
+    H = data.shape[-1] if data.ndim >= 2 else 0
+    n_true = source.numel() // H if H > 0 else 0
+    _row_constant = (
+        data.ndim >= 2
+        and mask.ndim >= 2
+        and (
+            mask.stride(-1) == 0
+            or mask.ndim < data.ndim
+            or (n_true > 0 and source.numel() == n_true * H)
+        )
+    )
+
+    mask, data = torch.broadcast_tensors(mask, data)
+
+    if _row_constant and n_true > 0:
+        mask_outer = mask[..., 0]
+        mask_f = mask_outer.reshape(-1)
+        data_2d = data.reshape(-1, H)
+        source_2d = source.reshape(n_true, H)
+        mask_i = mask_f.long()
+        source_idx = torch.cumsum(mask_i, 0) - 1
+        source_idx = torch.clamp(source_idx, 0, n_true - 1)
+        gathered = source_2d[source_idx]
+        result = torch.where(mask_f.unsqueeze(-1), gathered, data_2d)
+        return result.view_as(data)
+
+    mask_f = mask.reshape(-1)
+    data_flat = data.reshape(-1)
+    source_flat = source.reshape(-1)
+
+    mask_i = mask_f.long()
+    source_idx = torch.cumsum(mask_i, 0) - 1
+    source_idx = torch.clamp(source_idx, 0, source_flat.numel() - 1)
+
+    gathered = source_flat[source_idx]
+    result_flat = torch.where(mask_f, gathered, data_flat)
+
+    return result_flat.view_as(data)
+
+
+# TODO: DO we ever need this?
+def _get_default_decomposition_ops() -> DecompositionOpsList:
+    aten = torch.ops.aten
+    # default decompositions pulled from SHARK / torch._decomp
+    return [
+        aten.norm.ScalarOpt_dim,
+        aten.native_group_norm,
+        aten.split.Tensor,
+        # aten.split_with_sizes,
+        aten.native_layer_norm,
+        aten.masked_fill.Tensor,
+        aten.masked_fill.Scalar,
+        aten.t,
+        aten.addmm,
+        aten.squeeze.dims,
+        # decompositions for miscellaneous ops that are not handled in torch-mlir but have available decompositions
+        aten.grid_sampler_2d,
+        aten._adaptive_avg_pool2d,
+        aten.full,
+        aten._log_softmax,
+        aten.lift_fresh_copy.default,
+        aten._unsafe_index.Tensor,
+        aten.slice_scatter,
+    ]
+
+
+def histc(input, bins=100, min=0, max=0):
+    """Decomposition for aten.histc via one_hot + sum."""
+    # torch.histc: equal bounds (min == max, including the 0/0 default) mean "use the
+    # tensor's own range"; if that range is degenerate (constant input), widen by 1
+    # on each side -- matching aten's reference kernel:
+    # https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/cuda/SummaryOps.cu#L331
+    if min == max:
+        lo, hi = input.min(), input.max()
+        same = (lo == hi).to(input.dtype)
+        lo, hi = lo - same, hi + same
+    else:
+        lo, hi = min, max
+    x = input.flatten()
+    # bin index of each value; clamp pulls v == hi into the last bin.
+    idx = torch.floor((x - lo) / (hi - lo) * bins).to(torch.long).clamp(0, bins - 1)
+    # values outside [lo, hi] and NaN (compares False) are not counted.
+    valid = (x >= lo) & (x <= hi)
+    onehot = torch.nn.functional.one_hot(idx, bins).to(input.dtype)
+    return (onehot * valid.unsqueeze(-1).to(input.dtype)).sum(dim=0)
+
+
+def _get_custom_decompositions() -> DecompositionTable:
+    aten = torch.ops.aten
+    return {
+        aten.copy.default: copy_default,
+        aten.matmul.default: matmul,
+        aten.dot.default: dot,
+        # Interpolation decompositions here perform interpolation
+        # using a series of matmuls against constant tensors.
+        # They are necessary as the default aten decompositions
+        # use gather, which we cannot lower from ttir-to ttnn
+        # in the form presented by this decomposition.
+        # The better (and more performant) solution to this is
+        # to fuse the gather-based pattern in tt-mlir to the correct
+        # interpolation op.
+        aten.upsample_nearest1d.vec: upsample_nearest_vec,
+        aten.upsample_nearest2d.vec: upsample_nearest_vec,
+        aten.upsample_nearest3d.vec: upsample_nearest_vec,
+        aten.upsample_linear1d.vec: upsample_linear_vec,
+        aten.upsample_bilinear2d.vec: upsample_linear_vec,
+        aten.upsample_trilinear3d.vec: upsample_linear_vec,
+        aten.upsample_nearest1d.default: upsample_nearest_default,
+        aten.upsample_nearest2d.default: upsample_nearest_default,
+        aten.upsample_nearest3d.default: upsample_nearest_default,
+        aten.upsample_linear1d.default: upsample_linear_default,
+        aten.upsample_bilinear2d.default: upsample_linear_default,
+        aten.upsample_trilinear3d.default: upsample_linear_default,
+        # TODO: Test if this is still necessary when compiling via torch-xla
+        aten.adaptive_avg_pool2d.default: aten._adaptive_avg_pool2d,
+        # TODO: Test if this is still necessary when compiling via torch-xla
+        aten.avg_pool2d.default: avg_pool2d,
+        aten.split_with_sizes.default: split_with_sizes,
+        aten.masked_fill.Tensor: masked_fill_tensor,
+        torch.ops.prims.squeeze.default: squeeze,
+        torch.ops.aten.bitwise_and.Tensor: boolean_bitwise_and,
+        torch.ops.aten.bitwise_or.Tensor: boolean_bitwise_or,
+        aten.masked_scatter.default: masked_scatter,
+        aten.sum.dim_IntList: sum_dim_IntList,
+        aten.histc.default: histc,
+    }
+
+
+def populate_decompositions() -> DecompositionTable:
+    decompositions = torch._decomp.core_aten_decompositions()
+
+    # Pytorch folds batch dimensions of bmms https://github.com/pytorch/pytorch/blob/a5436a5e8e4ee42d1debf52c2786c7ae0043a434/aten/src/ATen/native/LinearAlgebra.cpp#L1999.
+    # This breaks how shard specs prapagate through them, and introduces an all_gather in head parallel attention layers.
+    # We add a custom decomposition of mm -> einsum. For this reason, remove einsum decomposition.
+    decompositions.pop(torch.ops.aten.einsum.default)
+
+    # Dot product gets lowered to stablehlo.multiply, returning eltwise product
+    # of two tensors: https://github.com/tenstorrent/tt-xla/issues/2672
+    # A custom decomposition dot->matmul is added later (ref dot fn).
+    decompositions.pop(torch.ops.aten.dot.default)
+
+    decompositions.update(get_decompositions(_get_default_decomposition_ops()))
+    decompositions.update(_get_custom_decompositions())
+
+    return decompositions

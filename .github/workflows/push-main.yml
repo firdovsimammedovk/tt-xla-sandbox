@@ -1,0 +1,73 @@
+name: On push
+
+on:
+  push:
+    branches: [ "main" ]
+    paths-ignore:
+      - '**/*.md'
+      - '.gitignore'
+      - 'LICENSE'
+
+permissions:
+  contents: read
+  actions: write
+  packages: write
+  checks: write
+  pages: write
+  id-token: write
+  deployments: write
+
+jobs:
+
+  build-image:
+    uses: ./.github/workflows/call-build-docker.yml
+    secrets: inherit
+    with:
+      dockbuild: all
+
+  build-ttxla:
+    uses: ./.github/workflows/call-build.yml
+    secrets: inherit
+    name: "Build tt-xla"
+    needs: [ build-image ]
+    with:
+      docker_image: ${{ needs.build-image.outputs.docker-image }}
+      docker_image_manylinux: ${{ needs.build-image.outputs.docker-image-manylinux }}
+      build_types: release,explorer,manylinux
+
+  build-ttxla-debug:
+    uses: ./.github/workflows/call-build-debug.yml
+    name: "Build and test tt-xla (debug with coverage)"
+    secrets: inherit
+    needs: [ build-image ]
+    with:
+      docker_image: ${{ needs.build-image.outputs.docker-image }}
+
+  test:
+    needs: [ build-image, build-ttxla ]
+    uses: ./.github/workflows/call-test.yml
+    secrets: inherit
+    with:
+      test_suite: basic-test.json
+      docker_image: ${{ needs.build-image.outputs.docker-image-base }}
+      artifact_release_run_id: ${{ needs.build-ttxla.outputs.artifacts_run_id }}
+      artifact_suffix: ${{ needs.build-ttxla.outputs.artifact_suffix }}
+      wheel_build: manylinux
+
+  test_forge_models_push:
+    uses: ./.github/workflows/call-test.yml
+    secrets: inherit
+    needs: [ build-image, build-ttxla ]
+    with:
+      test_suite: model-test-push.json
+      docker_image: ${{ needs.build-image.outputs.docker-image }}
+      artifact_release_run_id: ${{ needs.build-ttxla.outputs.artifacts_run_id }}
+      artifact_suffix: ${{ needs.build-ttxla.outputs.artifact_suffix }}
+      wheel_build: manylinux
+
+  deploy-docs:
+    needs: [ build-image, build-ttxla ]
+    uses: ./.github/workflows/call-build-and-deploy-docs.yml
+    secrets: inherit
+    with:
+      docker_image: ${{ needs.build-image.outputs.docker-image }}

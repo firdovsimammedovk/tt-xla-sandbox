@@ -1,0 +1,51 @@
+# SPDX-FileCopyrightText: © 2024 Tenstorrent AI ULC
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+# This file incorporates work covered by the following copyright and permission notice:
+# SPDX-FileCopyrightText: Copyright 2023 The IREE Authors
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# https://llvm.org/LICENSE.txt
+
+# ----- TTPJRTUtils -----
+# Static lib containing utility logic: logging initialization and data type utilities.
+# Depends on: loguru, coverage_config
+
+add_library(TTPJRTUtils
+    "callback_worker.cc"
+    "data_type_utils.cc"
+    "logging.cc"
+)
+
+target_include_directories(TTPJRTUtils
+PRIVATE
+    # Includes used in .cpp files.
+    ${PROJECT_SOURCE_DIR}/pjrt_implementation/inc
+    ${TTMLIR_TOOLCHAIN_DIR}/include
+    ${PROJECT_SOURCE_DIR}/third_party/tt-mlir/install/include
+PUBLIC
+    # Includes used in public headers.
+    ${PROJECT_SOURCE_DIR}/third_party/loguru/src/loguru-install/include
+    ${PROJECT_SOURCE_DIR}/third_party/pjrt_c_api
+)
+
+add_dependencies(TTPJRTUtils
+    tt-mlir
+    loguru
+)
+
+target_link_libraries(TTPJRTUtils PUBLIC
+    coverage_config
+)
+
+target_link_libraries(TTPJRTUtils PRIVATE
+    loguru
+)
+
+target_link_directories(TTPJRTUtils PUBLIC
+    ${LOGURU_LIB_DIR}
+)
+
+set_target_properties(TTPJRTUtils PROPERTIES
+    UNIT_TESTS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/unit_tests"
+)

@@ -1,0 +1,156 @@
+# SPDX-FileCopyrightText: (c) 2025 Tenstorrent AI ULC
+#
+# SPDX-License-Identifier: Apache-2.0
+
+from dataclasses import dataclass
+from typing import Dict, Optional
+
+
+@dataclass
+class CompilerConfig:
+    """
+    Configuration for compiler options passed to the TT device compilation.
+
+    This class encapsulates various compiler knobs and optimizations that can be
+    applied during model compilation for TT device.
+    """
+
+    # Optimization level (0, 1, or 2) that controls multiple optimizer passes.
+    # Level 0 (default): All MLIR optimizer passes disabled
+    # Level 1: Basic optimizations
+    #     * Consteval prepare for conv2d weights
+    #     * Remove some op workarounds
+    #     * Enable conv2d + mul fusing
+    #     * Op level validation for inputs/outputs
+    # Level 2: Advanced optimizations
+    #     * All level 1 optimizations
+    #     * Memory layout optimizations (sharding)
+    optimization_level: int = 0
+
+    # Target dtype for weight conversion in matmul and linear operations.
+    # Valid values: "", "bfp_bf8", "bfp_bf4". Empty string disables.
+    experimental_weight_dtype: str = ""
+
+    # Enables experimental KV cache dtype override in MLIR optimizer passes.
+    experimental_kv_cache_dtype: Optional[str] = None
+
+    # Override math fidelity for all ttnn operations exposing compute kernel
+    # config. Valid values: "lofi", "hifi2", "hifi3", "hifi4", "ttnn_default".
+    # "ttnn_default" - means that we don't override math_fidelity in comiler,
+    # and let ttnn choose math_fidelity for each operation based on its own logic.
+    # If math_fidelity not set (None), the default behavior from MLIR is used. Currently,
+    # MLIR default is HiFi4 for all operations.
+    math_fidelity: Optional[str] = None
+
+    # Override fp32 destination accumulation for all ttnn operations exposing
+    # compute kernel config. If None, the default behavior from MLIR is used.
+    # Currently, MLIR default is true for all operations.
+    fp32_dest_acc_en: Optional[bool] = None
+
+    # Enables Conv2d fusion with multiply pattern in the TTNN fusing pass.
+    # TODO(sdjordjevicTT): This is a temporary option and will be removed once the underlying
+    # issue https://github.com/tenstorrent/tt-mlir/issues/4628 is fixed.
+    experimental_enable_fusing_conv2d_with_multiply_pattern: bool = False
+
+    # Enables transpose + matmul and transpose + linear ops fusion.
+    # When disabled, transpose is kept as a separate op which can be constevaled,
+    # potentially improving performance. However, this may cause OOM errors on
+    # some models until https://github.com/tenstorrent/tt-mlir/pull/6198 lands.
+    experimental_enable_permute_matmul_fusion: bool = True
+
+    # Enables the DRAM space-saving optimization pass (TTNNMemoryManagement) in
+    # the TTNN pipeline. Reduces peak DRAM use by propagating slices through
+    # surrounding ops and rewriting reshape/permute patterns.
+    experimental_enable_dram_space_saving_optimization: bool = False
+
+    # Enables trace hoisting for TTNN pipeline.
+    enable_trace: bool = False
+
+    # Enables IR dumping to a specified path.
+    export_path: str = ""
+
+    # When set, exported IRs are named: <stage>_<model_name>_g<N>_<timestamp>.mlir
+    export_model_name: str = ""
+
+    # Enables "try to recover structure" option for TTNN IR. Tries to match the
+    # structure of the original graph. This generates a more readable solution,
+    # useful when generating code.
+    codegen_try_recover_structure: bool = False
+
+    # Enable D2M subgraph creation pass for d2m elementwise fusion.
+    # Only effective when optimization_level >= 1 (optimizer must be enabled)
+    enable_create_d2m_subgraphs: bool = False
+
+    # Enable the all_reduce decomposition workaround which breaks all_reduce down
+    # into reduce_scatter + all_gather (or all_gather + local reduce).
+    all_reduce_workaround_enabled: bool = True
+
+    def to_jax_compiler_options(self) -> Dict[str, str]:
+        """
+        Convert CompilerConfig to JAX compiler_options dictionary format.
+
+        Returns:
+            Dictionary of compiler options in the format expected by jax.jit()
+        """
+        options = {}
+
+        if self.optimization_level:
+            options["optimization_level"] = str(self.optimization_level)
+
+        if self.experimental_weight_dtype:
+            options["experimental_weight_dtype"] = self.experimental_weight_dtype
+
+        if self.experimental_kv_cache_dtype is not None:
+            options["experimental-kv-cache-dtype"] = self.experimental_kv_cache_dtype
+
+        if self.math_fidelity is not None:
+            options["math_fidelity"] = self.math_fidelity
+
+        if self.fp32_dest_acc_en is not None:
+            options["fp32_dest_acc_en"] = "true" if self.fp32_dest_acc_en else "false"
+
+        if self.experimental_enable_fusing_conv2d_with_multiply_pattern:
+            options["experimental_enable_fusing_conv2d_with_multiply_pattern"] = "true"
+
+        if not self.experimental_enable_permute_matmul_fusion:
+            options["experimental_enable_permute_matmul_fusion"] = "false"
+
+        if self.experimental_enable_dram_space_saving_optimization:
+            options["experimental-enable-dram-space-saving-optimization"] = "true"
+
+        if self.enable_trace:
+            options["enable_trace"] = "true"
+
+        if self.export_path != "":
+            options["export_path"] = self.export_path
+
+        if self.export_model_name:
+            options["export_model_name"] = self.export_model_name
+
+        if self.codegen_try_recover_structure:
+            options["codegen_try_recover_structure"] = "true"
+
+        if self.enable_create_d2m_subgraphs:
+            if self.optimization_level < 1:
+                raise ValueError(
+                    f"optimization_level must be >= 1 when enable_create_d2m_subgraphs "
+                    f"is enabled, got optimization_level={self.optimization_level}"
+                )
+            options["enable_create_d2m_subgraphs"] = "true"
+
+        if not self.all_reduce_workaround_enabled:
+            options["all_reduce_workaround_enabled"] = "false"
+
+        return options
+
+    def to_torch_compile_options(self) -> Dict[str, str]:
+        """
+        Convert CompilerConfig to Torch compile options dictionary format.
+
+        Returns:
+            Dictionary of compiler options in the format expected by torch_xla.set_custom_compile_options()
+        """
+
+        # Currently, the options are the same as JAX. But keeping separate method
+        # in case of future differences.
+        return self.to_jax_compiler_options()

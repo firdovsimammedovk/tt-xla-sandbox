@@ -1,0 +1,55 @@
+# Project
+build/
+install/
+third_party/loguru
+third_party/tt-mlir
+
+# Binaries
+*.so
+
+# IDE
+.vscode/
+
+# Clangd
+.cache/
+compile_commands.json
+
+# CTest
+Testing/
+
+# Python
+__pycache__/
+.env
+.venv
+env/
+venv/*
+!venv/activate
+!venv/install_ttmlir_requirements.sh
+.env.sh
+*.egg-info
+*.whl
+
+# Packaging scripts write artifacts here.
+bindist/
+
+# temporary files
+._bringup_stage.txt
+temp/
+
+# Bisect artifacts
+.bisect-run/
+
+# Downloaded CI artifacts
+artifacts/
+
+# LLM accuracy reference outputs (generated on-demand during accuracy tests)
+tests/benchmark/reference_outputs/*.refpt
+
+# Perf benchmark generated modules
+/modules/
+
+# Runtime-generated tt-metal debug artifacts
+/generated/
+
+# Tracy profiling files
+/tracy_artifacts/

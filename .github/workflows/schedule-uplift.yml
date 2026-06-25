@@ -1,0 +1,113 @@
+# This workflow automates creation of uplift pull requests.
+# Uplift PR is created daily to uplift the submodule to the latest version.
+
+name: Nighty Uplift
+
+permissions:
+  actions: read
+  contents: write
+  issues: write
+  pull-requests: write
+
+on:
+  schedule:
+    - cron: '0 3 * * *'  # Runs at 03:00 UTC every day
+  workflow_dispatch:  # Manual trigger
+    inputs:
+      force-overwrite:
+        description: 'Proceed to force overwrite existing uplift branch PR if one exists.'
+        type: boolean
+        default: false
+
+jobs:
+  uplift-pr:
+    runs-on: ubuntu-latest
+
+    env:
+      TT_MLIR_SUBMODULE_PATH: third_party/tt-mlir
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          ref: main
+
+      - name: Abort if existing uplift PR exists and not forced
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Manual dispatch detected. Checking for existing uplift PR..."
+          # Find existing PR with head branch 'uplift'
+          EXISTING_PR_NUMBER=$(gh pr list --head uplift --base main --state open --json number --jq '.[0].number')
+          FORCE_INPUT="${{ github.event.inputs.force-overwrite }}"
+          if [ -n "$EXISTING_PR_NUMBER" ] && [ "$FORCE_INPUT" != "true" ]; then
+            echo "Existing uplift PR #$EXISTING_PR_NUMBER found and force-overwrite is not set. Aborting run."
+            exit 1
+          fi
+
+      - name: Set env variables
+        run: |
+          echo "TODAY=$(date +'%Y-%m-%d')" >> $GITHUB_ENV
+          echo "CURRENT_COMMIT_SHA=$(grep -oP 'set\(TT_MLIR_VERSION "\K[^"]+' third_party/CMakeLists.txt)" >> $GITHUB_ENV
+
+      - name: Fetch latest SHA of tt-mlir submodule
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          LATEST_TT_MLIR_VERSION=$(gh api repos/tenstorrent/tt-mlir/commits/main --jq '.sha')
+          echo "LATEST_TT_MLIR_VERSION=$LATEST_TT_MLIR_VERSION" >> $GITHUB_ENV
+
+      - name: Update tt-mlir reference in third_party/CMakeLists.txt
+        run: |
+          echo "Updating tt-mlir to SHA: $LATEST_TT_MLIR_VERSION"
+          sed -i "s/set(TT_MLIR_VERSION \".*\")/set(TT_MLIR_VERSION \"${LATEST_TT_MLIR_VERSION}\")/" third_party/CMakeLists.txt
+
+      - name: Fetch commit history from tt-mlir repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Clone the tt-mlir repository
+          cd ${{ runner.temp }}
+          echo "### List of tt-mlir commits since previous uplift:" > commit_list.txt
+          git clone https://github.com/tenstorrent/tt-mlir.git tt-mlir
+          cd tt-mlir
+          # Fetch commit history between $COMMIT_SHA and LATEST_SHA
+          git log --oneline ${{ env.CURRENT_COMMIT_SHA}}..${{ env.LATEST_TT_MLIR_VERSION }} >>../commit_list.txt
+          cd ..
+          cat commit_list.txt
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v8
+        id: create-pr
+        with:
+          branch: uplift
+          committer: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>
+          author: "acicovicTT <acicovic@tenstorrent.com>"
+          base: main
+          commit-message: "Uplift ${{ env.TT_MLIR_SUBMODULE_PATH }} to ${{ env.LATEST_TT_MLIR_VERSION }} ${{ env.TODAY }}"
+          title: "Uplift ${{ env.TT_MLIR_SUBMODULE_PATH }} to ${{ env.LATEST_TT_MLIR_VERSION }} ${{ env.TODAY }}"
+          body: "This PR uplifts the ${{ env.TT_MLIR_SUBMODULE_PATH }} to the ${{ env.LATEST_TT_MLIR_VERSION }}"
+          labels: uplift-mlir
+          delete-branch: true
+          token: ${{ secrets.GH_TOKEN }}
+
+      - name: Approve Pull Request
+        if: ${{ steps.create-pr.outputs.pull-request-number }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_APPROVE_TOKEN }}
+        run: |
+          echo "Pull Request Number - ${{ steps.create-pr.outputs.pull-request-number }}"
+          echo "Pull Request URL - ${{ steps.create-pr.outputs.pull-request-url }}"
+          gh pr review ${{ steps.create-pr.outputs.pull-request-number }} --approve
+
+      - name: Enable Pull Request Automerge and Add Comment with Commit List
+        if: ${{ steps.create-pr.outputs.pull-request-number }}
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          gh pr merge --squash --auto "${{ steps.create-pr.outputs.pull-request-number }}"
+          gh pr comment ${{ steps.create-pr.outputs.pull-request-number }} --body "$(cat ${{ runner.temp }}/commit_list.txt)"
+          rm -rf ${{ runner.temp }}/tt-mlir
+          rm -f ${{ runner.temp }}/commit_list.txt

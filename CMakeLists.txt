@@ -1,0 +1,132 @@
+# SPDX-FileCopyrightText: © 2024 Tenstorrent AI ULC
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+# This file incorporates work covered by the following copyright and permission notice:
+# SPDX-FileCopyrightText: Copyright 2023 The IREE Authors
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+# https://llvm.org/LICENSE.txt
+
+# Here is the dependency graph to easily keep track of components involved:
+#
+# pjrt_plugin_tt.so (TTPJRTTTDylib) # pjrt_implementation/src/CMakeLists.txt
+# |                                 # This is the final product of the build, a dynamic
+# |                                 # lib imported by JAX as a plugin
+# │
+# ├── TTPJRTBindings  # pjrt_implementation/src/CMakeLists.txt
+# │   └── TTPJRTApi  # pjrt_implementation/src/api/CMakeLists.txt
+# │       ├── TTMLIRCompiler (tt-mlir dynamic lib, product of tt-mlir build)
+# │       ├── TTMLIRRuntime (tt-mlir dynamic lib, product of tt-mlir build)
+# │       └── TTPJRTUtils  # pjrt_implementation/src/utils/CMakeLists.txt
+# │           └── loguru
+# │
+# └── coverage_config   # CMakeLists.txt
+
+# ----- Project, cmake, compiler settings -----
+
+cmake_minimum_required(VERSION 3.20)
+
+if (NOT DEFINED ENV{TTXLA_ENV_ACTIVATED})
+  message(FATAL_ERROR "tt-xla environment not activated. Please run 'source venv/activate'.")
+endif()
+
+project(TT_PJRT)
+cmake_policy(SET CMP0069 NEW)
+enable_testing()
+set(TTPJRT_SOURCE_DIR ${PROJECT_SOURCE_DIR})
+set(TTMLIR_TOOLCHAIN_DIR $ENV{TTMLIR_TOOLCHAIN_DIR})
+
+set(CMAKE_C_COMPILER clang)
+set(CMAKE_CXX_COMPILER clang++)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-rtti")
+
+# Use the version-matched LLD linker when available (matches tt-mlir/tt-metal).
+set(CMAKE_LINKER_TYPE DEFAULT)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  execute_process(COMMAND ${CMAKE_CXX_COMPILER} --version OUTPUT_VARIABLE CLANG_VERSION_INFO ERROR_QUIET)
+  string(REGEX MATCH "version ([0-9]+)\\.[0-9]+" CLANG_VERSION "${CLANG_VERSION_INFO}")
+  set(CLANG_VERSION_MAJOR ${CMAKE_MATCH_1})
+  find_program(LLD NAMES ld.lld-${CLANG_VERSION_MAJOR} ld.lld)
+  if(LLD)
+    execute_process(COMMAND ${LLD} --version OUTPUT_VARIABLE LLD_VERSION_INFO ERROR_QUIET)
+    string(REGEX MATCH "LLD ([0-9]+)\\.[0-9]+" LLD_VERSION "${LLD_VERSION_INFO}")
+    set(LLD_VERSION_MAJOR ${CMAKE_MATCH_1})
+    if(CLANG_VERSION_MAJOR EQUAL LLD_VERSION_MAJOR)
+      message(STATUS "Using LLD linker: ${LLD}")
+      set(CMAKE_LINKER_TYPE LLD)
+    endif()
+  endif()
+endif()
+
+option(TTMLIR_ENABLE_PERF_TRACE "Enable performance tracing in tt-mlir" ON)
+option(TTMLIR_ENABLE_BINDINGS_PYTHON "Enable Python bindings in tt-mlir" OFF)
+option(TTXLA_ENABLE_EXPLORER "Enable Explorer feature in tt-mlir" OFF)
+option(TTXLA_ENABLE_PJRT_TESTS "Enable PJRT tests" OFF)
+option(TTXLA_ENABLE_EWHEEL_INSTALL "Enable editable wheel install" ON)
+option(TTXLA_ENABLE_TOOLS "Enable building tools" ON)
+option(TTXLA_ENABLE_EMITPY_EXECUTION "Enable EmitPy execution via PythonModelRunner" ON)
+option(TT_RUNTIME_DEBUG "Enable ttmlir runtime debugging" OFF)
+option(TT_USE_SYSTEM_SFPI "Use system SFPI" OFF)
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+  set(TTXLA_ENABLE_PJRT_TESTS ON)
+endif()
+
+set(TTMLIR_BUILD_TYPE "Release" CACHE STRING "Build type for tt-mlir")
+set_property(CACHE TTMLIR_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "RelWithDebInfo" "MinSizeRel")
+
+if(TTXLA_ENABLE_EXPLORER)
+    set(TTMLIR_ENABLE_BINDINGS_PYTHON ON)
+    set(TT_RUNTIME_DEBUG ON)
+endif()
+
+option(TTXLA_TRACY_ZONES "Enable PJRT tracy zones" OFF)
+
+# ----- coverage_config -----
+
+add_library(coverage_config INTERFACE)
+option(CODE_COVERAGE "Enable coverage reporting" OFF)
+if(CODE_COVERAGE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  # Add required flags (GCC & LLVM/Clang)
+  target_compile_options(coverage_config INTERFACE
+    -O0        # no optimization
+    -g         # generate debug info
+    --coverage # sets all required flags
+  )
+  if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.13)
+    target_link_options(coverage_config INTERFACE --coverage)
+  else()
+    target_link_libraries(coverage_config INTERFACE --coverage)
+  endif()
+endif(CODE_COVERAGE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+
+
+# set(ASAN_FLAGS "-fsanitize=address -fno-omit-frame-pointer")
+# set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${ASAN_FLAGS}")
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    add_definitions(-DDEBUG)
+endif()
+
+link_directories(${TTMLIR_TOOLCHAIN_DIR}//lib)
+
+if(CMAKE_BUILD_TYPE STREQUAL "Debug" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+    add_definitions(-DLOGURU_DEBUG_LOGGING=1)
+endif()
+
+# Set up library directories for third-party dependencies
+include(GNUInstallDirs)
+set(TTMLIR_INSTALL_PREFIX "${PROJECT_SOURCE_DIR}/third_party/tt-mlir/install")
+set(TTMLIR_LIB_DIR "${TTMLIR_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}")
+set(LOGURU_INSTALL_PREFIX "${PROJECT_SOURCE_DIR}/third_party/loguru/src/loguru-install")
+set(LOGURU_LIB_DIR "${LOGURU_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}")
+
+add_subdirectory(pjrt_implementation/src)
+add_subdirectory(third_party)
+add_subdirectory(docs)
+add_subdirectory(python_package)
+
+if(TTXLA_ENABLE_PJRT_TESTS)
+    add_subdirectory(tests/pjrt)
+endif()

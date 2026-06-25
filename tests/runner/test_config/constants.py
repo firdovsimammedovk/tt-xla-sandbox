@@ -1,0 +1,87 @@
+# SPDX-FileCopyrightText: (c) 2025 Tenstorrent AI ULC
+#
+# SPDX-License-Identifier: Apache-2.0
+
+"""Shared constants for test configuration validation, loading, and discovery."""
+
+# Allowed architecture identifiers for arch_overrides and --arch option
+ALLOWED_ARCHES = {
+    "n150",
+    "p150",
+    "n300",
+    "n300-llmbox",
+    "galaxy-wh-6u",
+    "qb2-blackhole",
+    "lb-blackhole",
+}
+
+# Allowed fields in test_config YAML entries
+ALLOWED_FIELDS = {
+    # Comparator controls
+    "required_pcc",
+    "assert_pcc",
+    "assert_atol",
+    "required_atol",
+    "assert_allclose",
+    "allclose_rtol",
+    "allclose_atol",
+    # Status/metadata
+    "status",
+    "reason",
+    "bringup_status",
+    "markers",
+    "supported_archs",
+    "batch_size",
+    # Nested arch overrides
+    "arch_overrides",
+    # Needed for training tests
+    "execution_pass",
+    # FileCheck patterns list
+    "filechecks",
+    # Compiler config options
+    "enable_weight_bfp8_conversion",
+    "optimization_level",
+    # Whether to inject a custom MoE implementation in the test (using the sparse_mlp.py in tt_torch).
+    "inject_custom_moe",
+    # EmitPy verification: assert exact match between emitpy and flatbuffer results
+    "emitpy_assert_exact",
+}
+
+# Single source of truth for the placeholders YAML filename
+PLACEHOLDERS_FILENAME = "test_config_placeholders.yaml"
+
+# Frameworks mapped to their config directory names
+FRAMEWORKS = ("torch", "jax", "torch_llm")
+
+# Parallelism values for test ID cross-product
+PARALLELISMS_STANDARD = ("single_device", "data_parallel", "tensor_parallel")
+PARALLELISMS_LLM = (
+    "single_device",
+    "tensor_parallel",
+    "megatron-no_dp-tensor_parallel",
+    "fsdp-no_dp-tensor_parallel",
+    "fsdp-dp-tensor_parallel",
+    "megatron-dp-tensor_parallel",
+)
+LLM_MESH_SHAPES = (
+    "mesh_default",
+    "mesh_1x4",
+    "mesh_2x2",
+    "mesh_1x8",
+    "mesh_2x4",
+    "mesh_4x8",
+)
+
+# Run modes
+RUN_MODES_STANDARD = ("inference", "training")
+RUN_MODES_LLM = ("inference", "training")
+
+# LLM phases
+LLM_PHASES = {"load_inputs_decode": "llm_decode", "load_inputs_prefill": "llm_prefill"}
+
+# LLM parametrization values (mirrors test_models.py)
+LLM_SEQUENCE_LENGTHS = (128, 1024, 2048, 4096, 8192)
+LLM_BATCH_SIZES = (1, 4)
+
+# Models excluded from PyTorch discovery (matches dynamic_loader.py)
+TORCH_EXCLUDED_MODEL_DIRS = {"suryaocr"}

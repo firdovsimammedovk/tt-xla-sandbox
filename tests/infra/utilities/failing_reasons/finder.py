@@ -1,0 +1,101 @@
+# SPDX-FileCopyrightText: © 2024 Tenstorrent AI ULC
+
+# SPDX-License-Identifier: Apache-2.0
+
+# Failing reasons finder
+
+from typing import Generator, Optional
+
+from ttxla_tools.logging import logger
+
+from .checks_xla import FailingReasons
+from .utils import ExceptionData, ExceptionReason, PyTestUtils
+
+
+class FailingReasonsFinder:
+    @classmethod
+    def build_ex_data(
+        cls,
+        exception_value: Exception,
+        exception_traceback: str,
+        stdout: str = None,
+        stderr: str = None,
+    ) -> ExceptionData:
+        """Convert exception to ExceptionData object
+
+        Args:
+            exception_value (Exception): Raised exception
+            exception_traceback (str): Exception traceback
+
+        Returns:
+            ExceptionData: Exception data object
+        """
+        ex_class_name = (
+            f"{type(exception_value).__module__}.{type(exception_value).__name__}"
+        )
+        ex_class_name = ex_class_name.replace("builtins.", "")
+        ex_message = f"{exception_value}"
+        exception_traceback = PyTestUtils.remove_colors(exception_traceback)
+        ex_data = ExceptionData(
+            class_name=ex_class_name,
+            message=ex_message,
+            error_log=exception_traceback,
+            stdout=stdout,
+            stderr=stderr,
+        )
+        return ex_data
+
+    @classmethod
+    def find_reason_by_ex_data(cls, ex: ExceptionData) -> Optional["ExceptionReason"]:
+        reasons = list(cls.find_reasons_by_ex_data(ex))
+        if not reasons:
+            # If no failing reason is found, classify as UNCLASSIFIED
+            return ExceptionReason(failing_reasons=FailingReasons.UNCLASSIFIED)
+        if len(reasons) > 1:
+            # Extract just the error message from stderr for cleaner logging
+            error_msg = None
+            if ex.stderr:
+                for line in ex.stderr.split("\n"):
+                    if "error:" in line:
+                        error_start = line.find("error:")
+                        if error_start != -1:
+                            error_msg = line[error_start:].strip()
+                            break
+            if error_msg:
+                logger.warning(
+                    f"Multiple reasons found: {[r.failing_reasons.name if r.failing_reasons else 'None' for r in reasons]} for: {error_msg}"
+                )
+            else:
+                logger.warning(
+                    f"Multiple reasons found: {[r.failing_reasons.name if r.failing_reasons else 'None' for r in reasons]}"
+                )
+        return reasons[0]
+
+    @classmethod
+    def find_reasons_by_ex_data(
+        cls, ex: ExceptionData
+    ) -> Generator["ExceptionReason", None, None]:
+        for failing_reason in FailingReasons:
+            # Checking if exception data matches the failing reason
+            exception_reason = failing_reason.value.check(ex)
+            if exception_reason is not None:
+                exception_reason.failing_reasons = failing_reason
+                yield exception_reason
+
+    @classmethod
+    def find_reason_by_exception(
+        cls, exc: Exception, stdout: str, stderr: str
+    ) -> Optional["ExceptionReason"]:
+        """Find failing reason by exception"""
+        # Get long representation of exception
+        long_repr = PyTestUtils.get_long_repr(exc)
+
+        # Build ExceptionData from exception
+        ex_data: ExceptionData = FailingReasonsFinder.build_ex_data(
+            exc, long_repr, stdout, stderr
+        )
+
+        # Find failing reason by ExceptionData
+        failing_reason = FailingReasonsFinder.find_reason_by_ex_data(ex_data)
+
+        return failing_reason
