@@ -179,6 +179,8 @@
 
 {#── Footer: inject global Search / Ask AI scripts ───────────────#}
 {%- block footer %}
+{#- Keep the left sidebar from jumping to the top on every navigation -#}
+<script src="https://firdovsimammedovk.github.io/tenstorrent-sandbox/_static/sidebar-scroll.js"></script>
 <script id="tt-search-script"
         src="https://firdovsimammedovk.github.io/tenstorrent-sandbox/_static/tt-search.js"
         data-search-url="{{ pathto('search') }}"
