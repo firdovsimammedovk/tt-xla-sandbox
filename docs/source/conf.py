@@ -68,7 +68,7 @@ _XLA_BASE = "https://firdovsimammedovk.github.io/tt-xla-sandbox/"
 
 html_theme = "sphinx_rtd_theme"
 html_theme_options = {
-    "collapse_navigation": True,
+    "collapse_navigation": False,
     "titles_only": True,
     "navigation_depth": 2,
 }
